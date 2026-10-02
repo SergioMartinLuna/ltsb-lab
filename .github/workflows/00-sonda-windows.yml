@@ -1,0 +1,160 @@
+name: EXP-000 sonda del runner Windows
+
+# Experimento 000. Mide si un runner windows-latest puede ejecutar una VM minima
+# con QEMU, y con que acelerador.
+#
+# Lo que NO hace, por diseno:
+#   - no descarga ninguna ISO
+#   - no crea ni instala Windows 10 14393
+#   - no toca la maquina del usuario
+#   - no habilita features de Windows ni reinicia el runner
+#
+# Lo que SI hace:
+#   - identifica el runner (SO, build, CPU, RAM, privilegios)
+#   - lee el estado del hypervisor: features, bcdedit, requisitos de systeminfo
+#   - mide disco y conectividad
+#   - instala QEMU por Chocolatey
+#   - arranca una VM Linux minima (solo kernel + initramfs de Alpine netboot)
+#     dos veces: con -accel whpx y con -accel tcg
+#   - arma reporte.json con los datos crudos
+#
+# Criterio de exito de un arranque: el token EXP000_USERSPACE_OK aparece en la
+# consola serie Y el guest se apaga solo. Un timeout NO es exito.
+#
+# Detalle: docs/02-experimento-000-sonda.md
+# Script:  scripts/exp-000/
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/00-sonda-windows.yml'
+      - 'scripts/exp-000/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: exp-000-sonda
+  cancel-in-progress: false
+
+jobs:
+  sonda:
+    name: capacidades del runner windows-latest
+    # Windows Server 2025, 4 vCPU, 16 GB RAM, 14 GB SSD garantizados.
+    # runs-on: windows-latest y windows-2025 son la misma imagen hoy. Se deja
+    # windows-latest para que el experimento siga al valor por defecto.
+    runs-on: windows-latest
+    # Margen holgado: instalar QEMU por Chocolatey y arrancar dos VMs consume
+    # bastante mas que la sonda en si. El limite duro de GitHub son 6 h.
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        # Windows PowerShell 5.1, no PowerShell 7. Es el motor que valida
+        # scripts/validar-powershell.ps1 y el que corre dentro de 14393. Con
+        # 'pwsh' se revisaria una sintaxis y se ejecutaria otra.
+        shell: powershell
+
+    env:
+      # Todo lo que produce el job vive aqui, y sube entero como artifact.
+      WORK: ${{ github.workspace }}\exp-000
+      SONDA: ${{ github.workspace }}\exp-000\sonda
+      SCRIPT: ${{ github.workspace }}\scripts\exp-000
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: preparar directorios
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path $env:SONDA -Force | Out-Null
+          Write-Output ("sonda: {0}" -f $env:SONDA)
+          Write-Output ("scripts: {0}" -f $env:SCRIPT)
+
+      # --- 1. identidad, hypervisor, disco, red ---------------------------
+      - name: 1 medir entorno
+        id: entorno
+        shell: powershell
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File "$env:SCRIPT\entorno.ps1" -SalidaTsv "$env:SONDA\entorno.tsv"
+
+      # --- 2. QEMU y guest minimo ----------------------------------------
+      - name: 2 instalar qemu y preparar guest
+        id: preparar
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File "$env:SCRIPT\preparar.ps1" `
+              -DirectorioTrabajo $env:WORK -SalidaTsv "$env:SONDA\preparar.tsv"
+
+      # --- 3. arranque con WHPX ------------------------------------------
+      # Sin fallback: se pasa -accel whpx sin alternativa. Si WHPX no esta
+      # disponible QEMU aborta y queda registrado, en vez de emular en silencio
+      # y reportar un exito que no ocurrio.
+      - name: 3 arrancar vm con whpx
+        id: whpx
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File "$env:SCRIPT\invocar-vm.ps1" `
+              -Acelerador whpx `
+              -Kernel "$env:WORK\vmlinuz-lts" `
+              -Initrd "$env:WORK\initramfs-lts" `
+              -Disco "$env:WORK\disco.qcow2" `
+              -ArchivoComandos "$env:SCRIPT\comandos-guest.txt" `
+              -SalidaTsv "$env:SONDA\whpx.tsv" `
+              -TimeoutSegundos 240
+
+      # --- 4. arranque con TCG -------------------------------------------
+      # TCG emula instrucciones: es el plan B y tambien la linea base de
+      # rendimiento contra la que se compara WHPX.
+      - name: 4 arrancar vm con tcg
+        id: tcg
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File "$env:SCRIPT\invocar-vm.ps1" `
+              -Acelerador tcg `
+              -Kernel "$env:WORK\vmlinuz-lts" `
+              -Initrd "$env:WORK\initramfs-lts" `
+              -Disco "$env:WORK\disco.qcow2" `
+              -ArchivoComandos "$env:SCRIPT\comandos-guest.txt" `
+              -SalidaTsv "$env:SONDA\tcg.tsv" `
+              -TimeoutSegundos 600
+
+      # --- 5. reporte ----------------------------------------------------
+      - name: 5 consolidar reporte
+        if: always()
+        shell: powershell
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File "$env:SCRIPT\consolidar.ps1" `
+              -DirectorioSonda $env:SONDA `
+              -SalidaJson "$env:WORK\reporte.json" `
+              -SalidaResumen "$env:WORK\resumen.md"
+          $ErrorActionPreference = 'Stop'
+          Get-Content -LiteralPath "$env:WORK\resumen.md" -Raw |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          Write-Output ''
+          Write-Output '--- reporte.json ---'
+          Get-Content -LiteralPath "$env:WORK\reporte.json" -Raw
+
+      - name: 6 subir evidencia
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exp-000-sonda-windows
+          path: |
+            exp-000/reporte.json
+            exp-000/resumen.md
+            exp-000/sonda/*.tsv
+            exp-000/sonda/*.log
+          retention-days: 30
+          if-no-files-found: warn

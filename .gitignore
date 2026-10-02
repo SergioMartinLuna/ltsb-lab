@@ -1,0 +1,38 @@
+# temporales de la validacion estatica
+.tmp-validar/
+.tmp-prueba-*/
+
+# salida del job de EXP-000 cuando se corre en local. En el runner esto vive
+# en el artifact del job, no en el repo.
+exp-000/
+
+# evidencia pesada: vive en los artifacts de Actions, no en el repo
+# (resultados/ SI se versiona: guarda la bitacora en Markdown, que es la
+#  interpretacion. Los datos crudos van al artifact del job, no aqui.
+#  Ver docs/06-reproducibilidad-y-ejecucion.md §7)
+imagenes/
+logs/
+
+# la ISO troceada y la imagen base: nunca en git
+*.iso
+*.qcow2
+*.qcow
+*.vmdk
+*.vdi
+
+# piezas de la ISO troceada
+isos/
+SHA256SUMS
+partes/
+
+# ruido del host
+Thumbs.db
+desktop.ini
+.DS_Store
+*.lnk
+
+# locales de herramientas
+__pycache__/
+*.pyc
+.venv/
+venv/

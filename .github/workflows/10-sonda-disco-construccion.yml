@@ -1,0 +1,529 @@
+name: 10-sonda-disco-construccion
+
+# EXP-001 — Mide el pico REAL de almacenamiento al construir la base 14393 con
+# Windows Setup + Compact OS desde el inicio, dentro de un runner ubuntu-latest.
+#
+# NO construye la base definitiva: no publica la base en Releases. Solo sube el
+# informe de medicion como artifact.
+#
+# Criterio de decision escrito ANTES de ejecutar (docs/00, regla 2):
+#   VIABLE     <=> min(avail) >= 2.0 GB durante toda la corrida
+#   NO VIABLE  <=> min(avail) < 2.0 GB, o Setup falla con 0x80070070
+#
+# La aceptacion solo es concluyente sobre el piso garantizado (14 GB libres antes
+# de limpiar). Si el job aterriza en el SKU grande de repos publicos, el informe
+# lo marca como NO CONCLUYENTE aunque el pico sea holgado.
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_repo:
+        description: "owner/repo publico que aloja la ISO 14393 troceada"
+        required: true
+      iso_release_tag:
+        description: "Tag del Release con los trozos de la ISO"
+        required: true
+      iso_asset_prefix:
+        description: "Prefijo comun de los assets (p.ej. iso-14393.part)"
+        required: true
+      iso_sha256:
+        description: "SHA256 de la ISO reassemblada, separado por espacio"
+        required: true
+      iso_size_bytes:
+        description: "Tamano exacto de la ISO reassemblada, en bytes"
+        required: true
+      target_gb:
+        description: "Disco destino para Windows, en GB"
+        required: false
+        default: "12"
+      vm_ram_mb:
+        description: "RAM de la VM, en MB"
+        required: false
+        default: "4096"
+      wim_index:
+        description: "Indice de imagen en install.wim; vacio = autodeteccion por nombre Enterprise"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  medir:
+    name: medir-pico-de-construccion
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # ------------------------------------------------------------------
+      # Etapa 0 — censo del runner, sin tocar nada
+      # ------------------------------------------------------------------
+      - name: censo-inicial
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p medicion
+          {
+            echo "## Etapa 0 — censo del runner sin modificar"
+            echo
+            echo "- repositorio: publico (4 vCPU / 16 GB / 4-core SKU)"
+            echo "- version de imagen: \${ImageVersion:-desconocida}"
+            echo
+            echo '```'
+            echo '$ nproc'
+            nproc
+            echo
+            echo '$ free -b'
+            free -b
+            echo
+            echo '$ df -B1 -T / /mnt 2>/dev/null || df -B1 -T /'
+            df -B1 -T / /mnt 2>/dev/null || df -B1 -T /
+            echo
+            echo '$ lsblk -b -o NAME,SIZE,RO,TYPE,MOUNTPOINT'
+            lsblk -b -o NAME,SIZE,RO,TYPE,MOUNTPOINT
+            echo
+            echo '$ ls -l /dev/kvm'
+            ls -l /dev/kvm 2>&1 || true
+            echo '```'
+          } | tee medicion/00-censo-inicial.md
+
+          AVAIL_INICIAL=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+          echo "AVAIL_INICIAL_BYTES=$AVAIL_INICIAL" >> "$GITHUB_ENV"
+          {
+            echo "AVAIL_INICIAL_BYTES=$AVAIL_INICIAL"
+            echo "DISCO_TOTAL_BYTES=$(df -B1 --output=size / | tail -1 | tr -d ' ')"
+            echo "NPROC=$(nproc)"
+          } > medicion/censo.csv
+
+          # Clasificacion del SKU: define si el resultado es concluyente.
+          if [ "$AVAIL_INICIAL" -ge 40000000000 ]; then
+            SKU=grande
+          else
+            SKU=piso
+          fi
+          echo "SKU=$SKU" >> "$GITHUB_ENV"
+          echo "::notice::AVAIL inicial = $AVAIL_INICIAL bytes; clasificado como SKU $SKU"
+
+      # ------------------------------------------------------------------
+      # Etapa 1 — liberar toolchains preinstaladas (presupuesto efectivo medido)
+      # ------------------------------------------------------------------
+      - name: liberar-espacio-y-medir-de-nuevo
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /opt/google/chrome \
+            /opt/microsoft/msedge \
+            /opt/microsoft/powershell \
+            /opt/pipx \
+            /usr/lib/mono \
+            /usr/local/julia* \
+            /usr/local/lib/android \
+            /usr/local/lib/node_modules \
+            /usr/local/share/chromium \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/lib/llvm-* \
+            "${AGENT_TOOLSDIRECTORY:-/nonexistent}" 2>/dev/null || true
+          sudo rm -rf /var/cache/apt/archives/*.deb 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+
+          AFTER=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+          GANADO=$(( AFTER - BEFORE ))
+          echo "PRESUPUESTO_EFECTIVO_BYTES=$AFTER" >> "$GITHUB_ENV"
+          {
+            echo "AVAIL_ANTES_BYTES=$BEFORE"
+            echo "AVAIL_DESPUES_BYTES=$AFTER"
+            echo "RECUPERADO_BYTES=$GANADO"
+          } >> medicion/censo.csv
+          {
+            echo
+            echo "## Etapa 1 — presupuesto efectivo"
+            echo
+            echo "- libre antes de limpiar: $BEFORE bytes ($(awk "BEGIN{printf \"%.2f\", $BEFORE/1073741824}") GiB)"
+            echo "- libre despues de limpiar: $AFTER bytes ($(awk "BEGIN{printf \"%.2f\", $AFTER/1073741824}") GiB)"
+            echo "- **recuperado: $GANADO bytes ($(awk "BEGIN{printf \"%.2f\", $GANADO/1073741824}") GiB)**"
+          } >> medicion/00-censo-inicial.md
+          cat medicion/00-censo-inicial.md >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # Etapa 2 — ISO desde nuestro propio Release, nunca de un tercero
+      # ------------------------------------------------------------------
+      - name: obtener-iso-desde-release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p iso/partes
+          BASE="https://github.com/${{ github.event.inputs.iso_repo }}/releases/download/${{ github.event.inputs.iso_release_tag }}/${{ github.event.inputs.iso_asset_prefix }}"
+
+          i=0
+          while [ "$i" -lt 32 ]; do
+            URL="$BASE$(printf '%02d' "$i")"
+            CODIGO=$(curl -sS -L -o "iso/partes/p$i" -w '%{http_code}' "$URL" || true)
+            if [ "$CODIGO" != "200" ]; then
+              rm -f "iso/partes/p$i"
+              break
+            fi
+            echo "descargado $URL -> $(stat -c %s "iso/partes/p$i") bytes"
+            i=$((i + 1 ))
+          done
+
+          if [ "$i" -eq 0 ]; then
+            echo "::error::no se descargo ningun trozo; revisa iso_repo / iso_release_tag / iso_asset_prefix"
+            exit 1
+          fi
+
+          cat iso/partes/p* > iso/instalador.iso
+          # Los trozos duplican el tamano de la ISO mientras se ensambla. Se
+          # borran en el acto: durante el resto del job la ISO ocupa 3.33 GB,
+          # no 6.66 GB.
+          rm -rf iso/partes
+          sync
+          echo "trozos eliminados; ISO ensamblada: $(stat -c %s iso/instalador.iso) bytes"
+          TAM=$(stat -c %s iso/instalador.iso)
+          ESPERADO=${{ github.event.inputs.iso_size_bytes }}
+          echo "ISO_BYTES=$TAM" >> "$GITHUB_ENV"
+          if [ "$TAM" -ne "$ESPERADO" ]; then
+            echo "::error::tamano de ISO inesperado: $TAM != $ESPERADO"
+            exit 1
+          fi
+
+          echo "${{ github.event.inputs.iso_sha256 }}" | tr -d ' ' | grep -v '^$' > iso/esperado.sha256
+          ( cd iso && sha256sum -c esperado.sha256 instalador.iso )
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wimtools > /dev/null
+
+          sudo mkdir -p iso/montada
+          sudo mount -o loop,ro iso/instalador.iso iso/montada
+          echo "ISO montada. contenido raiz:"
+          sudo ls iso/montada
+
+          {
+            echo "## Etapa 2 - ISO"
+            echo
+            echo "- bytes: $TAM"
+            echo "- GiB: $(awk "BEGIN{printf \"%.3f\", $TAM/1073741824}")"
+            echo "- sha256 verificado: si"
+            echo "- ocupacion real en disco (du): $(du -B1 iso/instalador.iso | cut -f1) bytes"
+            echo "- **no se copia al destino**: se adjunta como cdrom virtual de solo lectura"
+          } | tee medicion/01-iso.md
+          cat medicion/01-iso.md >> "$GITHUB_STEP_SUMMARY"
+
+          echo "--- indice de imagenes en install.wim ---"
+          sudo wiminfo iso/montada/sources/install.wim | tee medicion/install-wim-info.txt
+          echo "--- indice de imagenes en boot.wim ---"
+          sudo wiminfo iso/montada/sources/boot.wim | tee medicion/boot-wim-info.txt
+
+          WIM=$(sudo find /mnt /media iso/montada -maxdepth 4 -name install.wim 2>/dev/null | head -1)
+          [ -n "$WIM" ] || WIM=iso/montada/sources/install.wim
+          {
+            echo "install.wim en: $WIM"
+            echo "--- sha256 de install.wim ---"
+            sudo sha256sum "$WIM" | tee medicion/install-wim.sha256
+            echo "--- sha256 de boot.wim ---"
+            sudo sha256sum iso/montada/sources/boot.wim | tee medicion/boot-wim.sha256
+          } >> medicion/01-iso.md
+
+          # Descubre el indice de la imagen Enterprise/LTSB en vez de suponerlo.
+          # Criterio: el nombre o el nombre para mostrar contiene Enterprise.
+          INDICE=$(sudo wiminfo "$WIM" \
+            | awk '/^Available Images/ {f=1; next} f && /^ *Index: *[0-9]+/ {idx=$3} f && /(Enterprise|LTSB)/ && idx!="" {print idx; exit}')
+          if [ -z "$INDICE" ]; then
+            echo "::error::no se encontro una imagen Enterprise en install.wim"
+            exit 1
+          fi
+          echo "INDICE_WIM=$INDICE" >> "$GITHUB_ENV"
+          echo "imagen Enterprise detectada en el indice $INDICE" | tee -a medicion/01-iso.md
+          cat medicion/01-iso.md >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # Etapa 3 — herramientas y disco destino sparse
+      # ------------------------------------------------------------------
+      - name: preparar-disco-destino
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils ovmf > /dev/null
+          df -B1 -T / | tail -1 > medicion/df-tras-qemu.txt
+          df -B1 --output=avail / | tail -1 > medicion/avail-tras-qemu.txt
+
+          TARGET_GB=${{ github.event.inputs.target_gb }}
+          qemu-img create -f qcow2 lab/objetivo.qcow2 "${TARGET_GB}G"
+          {
+            echo "## Etapa 3 — disco destino"
+            echo
+            echo "- logico: ${TARGET_GB} GiB (sparse, preallocation=off)"
+            echo "- fisico inicial: $(du -B1 lab/objetivo.qcow2 | cut -f1) bytes"
+          } | tee medicion/02-destino.md
+          cat medicion/02-destino.md >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # Etapa 4 — unattend: Compact OS desde el inicio, sin hibernate ni pagefile
+      # ------------------------------------------------------------------
+      - name: escribir-unattend
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p aio
+          cat > aio/autoinstall.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <unattend xmlns="urn:schemas-microsoft-com:unattend">
+            <settings pass="windowsPE">
+              <component name="Microsoft-Windows-International-Core-WinPE"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral" versionScope="nonSxS">
+                <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+                <InputLocale>0409:00000409</InputLocale>
+                <SystemLocale>en-US</SystemLocale>
+                <UILanguage>en-US</UILanguage>
+                <UserLocale>en-US</UserLocale>
+              </component>
+              <component name="Microsoft-Windows-Setup"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral" versionScope="nonSxS">
+                <DiskConfiguration>
+                  <Disk wcm:action="add" wcm:namespace="\\?\root\wcs#diskvol0">
+                    <DiskID>0</DiskID>
+                    <WillWipeDisk>true</WillWipeDisk>
+                    <CreatePartitions>
+                      <CreatePartition wcm:action="add">
+                        <Order>1</Order>
+                        <Type>Primary</Type>
+                        <Size>2048</Size>
+                      </CreatePartition>
+                    </CreatePartitions>
+                    <ModifyPartitions>
+                      <ModifyPartition wcm:action="add">
+                        <Order>1</Order>
+                        <PartitionID>1</PartitionID>
+                        <Format>NTFS</Format>
+                        <Label>System</Label>
+                      </ModifyPartition>
+                      <ModifyPartition wcm:action="add">
+                        <Order>2</Order>
+                        <PartitionID>2</PartitionID>
+                        <Format>NTFS</Format>
+                        <Label>Windows</Label>
+                        <Active>true</Active>
+                      </ModifyPartition>
+                    </ModifyPartitions>
+                  </Disk>
+                  <ImageInstall>
+                    <OSImage>
+                      <InstallFrom>
+                        <MetaData wcm:action="add">
+                          <Key>/IMAGE/INDEX</Key>
+                          <Value>IMAGE_INDEX</Value>
+                        </MetaData>
+                      </InstallFrom>
+                      <InstallTo>
+                        <DiskID>0</DiskID>
+                        <PartitionID>2</PartitionID>
+                      </InstallTo>
+                      <Compact>true</Compact>
+                      <WillShowUI>OnError</WillShowUI>
+                    </OSImage>
+                  </ImageInstall>
+                  <UserData>
+                    <AcceptEula>true</AcceptEula>
+                    <ProductKey>
+                      <Key>A00001-00000-00000-00000-00000</Key>
+                    </ProductKey>
+                  </UserData>
+                </DiskConfiguration>
+              </component>
+            </settings>
+            <settings pass="oobeSystem">
+              <component name="Microsoft-Windows-Shell-Setup"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral" versionScope="nonSxS">
+                <OOBE>
+                  <HideEULAPage>true</HideEULAPage>
+                  <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                  <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                  <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                  <NetworkLocation>Work</NetworkLocation>
+                  <ProtectYourPC>3</ProtectYourPC>
+                  <SkipMachineOOBE>true</SkipMachineOOBE>
+                  <SkipUserOOBE>true</SkipUserOOBE>
+                </OOBE>
+              </component>
+            </settings>
+            <settings pass="specialize">
+              <component name="Microsoft-Windows-Shell-Setup"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral" versionScope="nonSxS">
+                <RunSynchronous>
+                  <RunSynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <Path>reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" /v PagingFiles /t REG_MULTI_SZ /d "" /f</Path>
+                    <Description>dejar pagefile en cero</Description>
+                  </RunSynchronousCommand>
+                  <RunSynchronousCommand wcm:action="add">
+                    <Order>2</Order>
+                    <Path>powercfg /hibernate off</Path>
+                    <Description>sin hiberfil.sys</Description>
+                  </RunSynchronousCommand>
+                </RunSynchronous>
+              </component>
+            </settings>
+          </unattend>
+          XML
+          INDICE="${{ github.event.inputs.wim_index }}"
+          INDICE="${INDICE:-$INDICE_WIM}"
+          echo "usando indice de imagen: $INDICE"
+          sed -i "s|IMAGE_INDEX|$INDICE|" aio/autoinstall.xml
+          echo "unattend escrito; Compact=true presente: $(grep -c '<Compact>true</Compact>' aio/autoinstall.xml)"
+
+          # autounattend.xml debe aparecer en la raiz de un medio extraible.
+          # Un fichero suelto no sirve: se empaqueta en una imagen FAT12/16 minima.
+          sudo apt-get install -y -qq dosfstools mtools > /dev/null
+          dd if=/dev/zero of=aio/autounattend.img bs=1M count=2 status=none
+          mkfs.vfat -F 16 -n UNATTEND aio/autounattend.img > /dev/null
+          mcopy -i aio/autounattend.img aio/autoinstall.xml ::autounattend.xml
+          echo "--- contenido de la imagen FAT ---"
+          mdir -i aio/autounattend.img ::
+
+      # ------------------------------------------------------------------
+      # Etapa 5 — sampler en el HOST, corriendo antes de que arranque Setup
+      # ------------------------------------------------------------------
+      - name: arrancar-sampler-y-Setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > sampler.sh <<SH
+          #!/bin/bash
+          WS="$GITHUB_WORKSPACE"
+          while true; do
+            AVAIL=\$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+            TARGET=\$(du -B1 "\$WS/lab/objetivo.qcow2" 2>/dev/null | cut -f1)
+            [ -z "\$TARGET" ] && TARGET=0
+            echo -e "\$(date +%s)\t\$AVAIL\t\$TARGET" >> "\$WS/medicion/samples.tsv"
+            sleep 2
+          done
+          SH
+          chmod +x sampler.sh
+          nohup ./sampler.sh > sampler.log 2>&1 &
+          echo $! > sampler.pid
+          sleep 3
+          echo "sampler pid $(cat sampler.pid); primera muestra:"
+          cat samples.tsv
+
+      - name: instalar-14393-con-compact-os
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          qemu-system-x86_64 \
+            -accel kvm \
+            -m "${{ github.event.inputs.vm_ram_mb }}" \
+            -smp 2 \
+            -machine q35 \
+            -drive file=lab/objetivo.qcow2,if=virtio,format=qcow2 \
+            -drive file=iso/instalador.iso,if=ide,media=cdrom,readonly=on \
+            -drive file=aio/autounattend.img,if=ide,media=cdrom,readonly=on \
+            -netdev user,id=n0 -device virtio-net-pci,net=n0 \
+            -nographic -serial file:consola-serial.log \
+            -rtc base=localtime \
+            -boot d \
+            -no-reboot
+          RC=$?
+          set -e
+          echo "qemu termino con codigo $RC"
+          echo "QEMU_RC=$RC" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # Etapa 6 — peak real, tablas y veredictos
+      # ------------------------------------------------------------------
+      - name: medir-y-emitir-veredicto
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          kill "$(cat sampler.pid)" 2>/dev/null || true
+          sleep 2
+
+          AVAIL_INICIAL="${AVAIL_INICIAL_BYTES:-0}"
+          DISCO_TOTAL="${DISCO_TOTAL_BYTES:-0}"
+          ISO_BYTES="${ISO_BYTES:-0}"
+          QEMU_RC="${QEMU_RC:-999}"
+          SKU="${SKU:-desconocido}"
+
+          awk -F'\t' 'NR==1{min=$2} $2<min{min=$2; lin=$1} END{print min > "minimo.txt"; print lin > "minimo_ts.txt"}' samples.tsv
+          awk -F'\t' 'BEGIN{m=0} $3>m{m=$3} END{print m+0 > "pico_destino.txt"}' samples.tsv
+          MIN_AVAIL=$(cat minimo.txt)
+
+          PICO=$(( AVAIL_INICIAL - MIN_AVAIL ))
+          PICO_DESTINO=$(cat pico_destino.txt)
+          RESIDUO=$(( PICO - ISO_BYTES - PICO_DESTINO ))
+          FINAL=$(du -B1 lab/objetivo.qcow2 2>/dev/null | cut -f1 || echo 0)
+
+          if [ "$MIN_AVAIL" -ge 2147483648 ] && [ "$QEMU_RC" -eq 0 ]; then
+            VEREDICTO="VIABLE"
+          else
+            VEREDICTO="NO-VIABLE"
+          fi
+          if [ "$SKU" != "piso" ]; then
+            CONCLUYENTE="NO-CONCLUYENTE (aterrizo en el SKU de 4 nucleos, no en el piso garantizado)"
+          else
+            CONCLUYENTE="SI (aterrizo en el piso garantizado)"
+          fi
+
+          {
+            echo "## Resultado de la medicion"
+            echo
+            echo "| Magnitud solicitada | Bytes | GiB |"
+            echo "|---|---:|---:|"
+            echo "| Espacio libre inicial real del runner | $AVAIL_INICIAL | $(awk "BEGIN{printf \"%.3f\",$AVAIL_INICIAL/1073741824}") |"
+            echo "| Espacio libre durante el despliegue | minimo observado | |"
+            echo "| Espacio libre en el peor momento | $MIN_AVAIL | $(awk "BEGIN{printf \"%.3f\",$MIN_AVAIL/1073741824}") |"
+            echo "| Espacio ocupado por la ISO | $ISO_BYTES | $(awk "BEGIN{printf \"%.3f\",$ISO_BYTES/1073741824}") |"
+            echo "| Espacio ocupado por el disco destino (maximo) | $PICO_DESTINO | $(awk "BEGIN{printf \"%.3f\",$PICO_DESTINO/1073741824}") |"
+            echo "| Temporales de Setup + auxiliares (residuo) | $RESIDUO | $(awk "BEGIN{printf \"%.3f\",$RESIDUO/1073741824}") |"
+            echo "| **Pico maximo real** | $PICO | $(awk "BEGIN{printf \"%.3f\",$PICO/1073741824}") |"
+            echo "| Tamano final de la base (qcow2 sin comprimir) | $FINAL | $(awk "BEGIN{printf \"%.3f\",$FINAL/1073741824}") |"
+            echo
+            echo "- muestras tomadas: $(wc -l < samples.tsv)"
+            echo "- qemu salio con codigo: $QEMU_RC"
+            echo "- clase de runner: $SKU"
+            echo "- conclusion: $CONCLUYENTE"
+            echo
+            echo "### COMPACT-OS-BUILD: $VEREDICTO"
+          } | tee medicion/VEREDICTO.md
+          cat medicion/VEREDICTO.md >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "avail_inicial_bytes=$AVAIL_INICIAL"
+            echo "presupuesto_efectivo_bytes=${PRESUPUESTO_EFECTIVO_BYTES:-0}"
+            echo "iso_bytes=$ISO_BYTES"
+            echo "disco_destino_pico_bytes=$PICO_DESTINO"
+            echo "min_avail_bytes=$MIN_AVAIL"
+            echo "pico_bytes=$PICO"
+            echo "disco_destino_final_bytes=$FINAL"
+            echo "residuo_bytes=$RESIDUO"
+            echo "sku=$SKU"
+            echo "qemu_rc=$QEMU_RC"
+            echo "veredicto=$VEREDICTO"
+            echo "concluyente=$CONCLUYENTE"
+          } > medicion/resultado.csv
+
+          sudo cp samples.tsv medicion/samples.tsv 2>/dev/null || cp samples.tsv medicion/samples.tsv
+          sudo umount iso/montada 2>/dev/null || true
+          cp consola-serial.log medicion/ 2>/dev/null || true
+
+      - name: subir-informe
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: medicion-pico-construccion
+          path: medicion/
+          retention-days: 30
