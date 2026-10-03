@@ -185,18 +185,19 @@ jobs:
           set -uo pipefail
           SOCK="$PWD/monitor.sock"
           rm -f "$SOCK"
-          qemu-img create -f qcow2 lab/destino.qcow2 20G > /dev/null 2>&1 || true
 
-          # Sin -boot d ni -no-reboot: aqui solo se quiere ver la CONSOLA del
-          # instalador, no automatizar nada.
+          # -machine pc (i440fx) y no q35: q35 no tiene controlador IDE real y
+          # "if=ide" no es de fiar ahi. i440fx lleva PIIX3 IDE, que es lo que
+          # espera un instalador de Windows 10 arrancando por BIOS.
           sudo qemu-system-x86_64 \
-            -accel kvm -m 4096 -smp 2 -machine q35 -vga std \
+            -accel kvm -m 4096 -smp 2 -machine pc -vga std \
             -drive file=lab/destino.qcow2,if=virtio,format=qcow2 \
             -drive file=iso/instalador.iso,if=ide,media=cdrom,readonly=on \
             -drive file=autounattend.img,if=ide,media=cdrom,readonly=on \
             -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
             -display none -serial file:consola.log \
             -monitor "unix:$SOCK,server,nowait" \
+            -debugcon file:debugcon.log -global isa-debugcon.iobase=0x402 \
             -boot order=d \
             -no-reboot > qemu-stdout.log 2>&1 &
           QPID=$!
@@ -208,19 +209,33 @@ jobs:
             exit 1
           fi
           ls -la monitor.sock 2>&1 || echo "SIN SOCKET"
-          # Conectar a un socket unix exige permiso de ESCRITURA sobre el socket.
-          # QEMU como root lo crea 0755 (others=r-x) y el usuario runner recibe
-          # PermissionError al conectarse.
           sudo chmod 0666 monitor.sock && echo "monitor.sock permiso 0666"
-          echo "--- primeras lineas de qemu-stdout.log ---"
-          head -20 qemu-stdout.log
+
+          # Señal textual decisiva: cuanto lee QEMU de la ISO. Si el instalador
+          # arranca, lee GBs del install.wim; si no arranca, se queda en ~0.
+          echo "--- muestreo de /proc/PID/io ---"
+          for i in $(seq 1 20); do
+            if [ -r "/proc/$QPID/io" ]; then
+              printf '%s\trchar=%s\tread_bytes=%s\twrite_bytes=%s\n' \
+                "$(date +%s)" \
+                "$(awk '/^rchar/{print $2}' /proc/$QPID/io)" \
+                "$(awk '/^read_bytes/{print $2}' /proc/$QPID/io)" \
+                "$(awk '/^write_bytes/{print $2}' /proc/$QPID/io)" \
+                | tee -a medicion/io.tsv
+            fi
+            sleep 15
+          done
 
           python3 hmp.py "$SOCK" medicion/pantallas 8
           echo "--- capturas obtenidas ---"
           ls -la medicion/pantallas
 
+          echo "--- DEBUGCON de SeaBIOS (prueba de arranque) ---"
+          cat debugcon.log 2>/dev/null | tail -40 || echo "sin debugcon.log"
+
           kill "$QPID" 2>/dev/null || true
           sleep 2
+          echo "--- tamano del disco destino ---"
           du -b lab/destino.qcow2 || true
 
       - name: convertir-y-subir
@@ -232,7 +247,7 @@ jobs:
             pnmtopng "$f" > "${f%.ppm}.png" 2>/dev/null && rm -f "$f"
           done
           ls -la medicion/pantallas || true
-          cp qemu-stdout.log consola.log medicion/ 2>/dev/null || true
+          cp qemu-stdout.log consola.log debugcon.log medicion/ 2>/dev/null || true
 
       - name: subir
         if: always()
