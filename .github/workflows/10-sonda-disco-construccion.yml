@@ -483,7 +483,9 @@ jobs:
             AVAIL=\$(df -B1 --output=avail / | tail -1 | tr -d ' ')
             TARGET=\$(du -B1 "\$WS/lab/objetivo.qcow2" 2>/dev/null | cut -f1)
             [ -z "\$TARGET" ] && TARGET=0
-            echo "\$(date +%s)\t\$AVAIL\t\$TARGET" >> "\$WS/samples.tsv"
+            # printf y no echo: con echo el "\t" se escribia LITERAL y awk -F'\t'
+            # no dividia los campos, dejando minimo.txt vacio.
+            printf '%s\t%s\t%s\n' "\$(date +%s)" "\$AVAIL" "\$TARGET" >> "\$WS/samples.tsv"
             sleep 2
           done
           SH
@@ -529,7 +531,9 @@ jobs:
             done
           ) &
 
-          timeout --signal=TERM --kill-after=60 "${VIGILANTE_MIN}" \
+          # GNU timeout toma un numero desnudo como SEGUNDOS. Sin la "m" final,
+          # "150" significa 150 s y el vigilante mataba a QEMU en 2,5 min (rc 124).
+          timeout --signal=TERM --kill-after=60 "${VIGILANTE_MIN}m" \
           $PREFIJO qemu-system-x86_64 \
             -accel kvm \
             -m "${{ github.event.inputs.vm_ram_mb }}" \
