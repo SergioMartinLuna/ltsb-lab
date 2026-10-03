@@ -52,7 +52,7 @@ jobs:
   medir:
     name: medir-pico-de-construccion
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       # ------------------------------------------------------------------
@@ -249,6 +249,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get install -y -qq qemu-system-x86 qemu-utils ovmf > /dev/null
+          mkdir -p lab
           df -B1 -T / | tail -1 > medicion/df-tras-qemu.txt
           df -B1 --output=avail / | tail -1 > medicion/avail-tras-qemu.txt
 
