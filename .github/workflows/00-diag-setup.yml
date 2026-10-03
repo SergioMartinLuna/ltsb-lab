@@ -8,15 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       variante:
-        description: 'Variante del unattend, para bisecar que elemento lo invalida'
+        description: 'Bus del disco destino (unica variable de este round)'
         required: false
-        default: 'K'
+        default: 'ide'
         type: choice
         options:
-          - J
-          - K
-          - L
-          - M
+          - ide
+          - virtio
 
 permissions:
   contents: read
@@ -81,29 +79,25 @@ jobs:
           #   C = A + Compact
           #   D = A + ProductKey
           #   E = todo (el unattend de la sonda)
-          # BISECADO round 3. Round 2 (37112351512..215) dio el MISMO error en las 4
-          # variantes: "Windows could not apply the unattend answer file's
-          # <DiskConfiguration> setting". Con lo cual InputLocale NO era el
-          # problema (F con etiqueta e I con hex fallan igual) y el unico
-          # sospechoso que queda es el propio DiskConfiguration, que en el
-          # round 1 (variante A, sin componente de idioma) nunca llego a
-          # aplicarse porque Setup se quedaba en la pantalla de idioma.
-          # Candidatos: wcm:namespace="\\?\root\wcs#diskvol0" y el layout de dos
-          # particiones (System Reserved + extend).
-          #   J = sin wcm:namespace, layout de dos particiones
-          #   K = sin wcm:namespace, layout canonico de una sola particion
-          #   L = CON wcm:namespace, layout de una particion  (aísla el namespace)
-          #   M = sin wcm:namespace, una particion, sin WillWipeDisk
+          # ROUND 4. Lo queazoo rondas anteriores dejaron aislado:
+          #   - wcm:namespace, el layout de particiones y WillWipeDisk NO son la
+          #     causa: las 4 variantes fallaron igual (runs 37113492783..21293).
+          #   - El componente International-Core-WinPE no es la causa en si mismo:
+          #     lo unico que hace es saltarse la pantalla de idioma, con lo que
+          #     Setup llega a intentar aplicar el disco y aBJAR el error.
+          #   - El mensaje es "Windows could not apply the unattend answer file's
+          #     <DiskConfiguration> setting", es decir Setup NO PUEDE aplicar el
+          #     disco, no que el XML este mal.
+          # Hipotesis: el disco destino esta en virtio-blk y el WinPE de la ISO de
+          # Microsoft NO trae ese controlador, asi que Setup no ve ningun disco y
+          # no puede aplicar DiskConfiguration. Sin el componente de idioma Setup se
+          # queda antes, en la pantalla de idioma, y el problema queda oculto.
+          # Se mantiene el XML identico al de la sonda y solo cambia el bus.
           VARIANTE="${{ github.event.inputs.variante }}"
-          VARIANTE="${VARIANTE:-K}"
-          echo "variante a probar: $VARIANTE"
-          case "$VARIANTE" in
-            J) LANG=2; WU=1; COMPACT=0; KEY=0; NS=0; LAYOUT=dos; WIPE=1 ;;
-            K) LANG=2; WU=1; COMPACT=0; KEY=0; NS=0; LAYOUT=uno; WIPE=1 ;;
-            L) LANG=2; WU=1; COMPACT=0; KEY=0; NS=1; LAYOUT=uno; WIPE=1 ;;
-            M) LANG=2; WU=1; COMPACT=0; KEY=0; NS=0; LAYOUT=uno; WIPE=0 ;;
-            *) echo "::error::variante desconocida: $VARIANTE"; exit 1 ;;
-          esac
+          VARIANTE="${VARIANTE:-ide}"
+          BUS="$VARIANTE"
+          echo "bus del disco a probar: $BUS"
+          LANG=2; WU=1; COMPACT=0; KEY=0; NS=1; LAYOUT=dos; WIPE=1
 
           {
           cat <<'HEAD'
@@ -328,11 +322,25 @@ jobs:
           # -machine pc (i440fx) y no q35: q35 no tiene controlador IDE real y
           # "if=ide" no es de fiar ahi. i440fx lleva PIIX3 IDE, que es lo que
           # espera un instalador de Windows 10 arrancando por BIOS.
+          #
+          # El bus del disco destino es la variable de este round:
+          #   virtio -> virtio-blk, que el WinPE de la ISO de Microsoft no trae
+          #   ide    -> PIIX3 IDE, que WinPE ya enumera sin inyectar drivers
+          if [ "$BUS" = "ide" ]; then
+            DEST="-drive file=lab/destino.qcow2,if=none,id=disk0,format=qcow2 -device ide-hd,drive=disk0,bus=ide.0,unit=0"
+            echo "disco destino en IDE (ide.0.0)"
+          else
+            DEST="-drive file=lab/destino.qcow2,if=virtio,format=qcow2"
+            echo "disco destino en virtio-blk"
+          fi
+
           sudo qemu-system-x86_64 \
             -accel kvm -m 4096 -smp 2 -machine pc -vga std \
-            -drive file=lab/destino.qcow2,if=virtio,format=qcow2 \
-            -drive file=iso/instalador.iso,if=ide,media=cdrom,readonly=on \
-            -drive file=autounattend.img,if=ide,media=cdrom,readonly=on \
+            $DEST \
+            -drive file=iso/instalador.iso,if=none,id=cd0,media=cdrom,readonly=on \
+              -device ide-cd,drive=cd0,bus=ide.1,unit=0 \
+            -drive file=autounattend.img,if=none,id=cd1,media=cdrom,readonly=on \
+              -device ide-cd,drive=cd1,bus=ide.1,unit=1 \
             -drive file=autounattend.flp,if=floppy,format=raw \
             -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
             -display none -serial file:consola.log \
