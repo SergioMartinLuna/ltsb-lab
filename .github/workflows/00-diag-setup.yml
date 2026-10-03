@@ -6,6 +6,18 @@ name: 00-diag-setup
 
 on:
   workflow_dispatch:
+    inputs:
+      variante:
+        description: 'Variante del unattend, para bisecar que elemento lo invalida'
+        required: false
+        default: 'E'
+        type: choice
+        options:
+          - A
+          - B
+          - C
+          - D
+          - E
 
 permissions:
   contents: read
@@ -62,11 +74,36 @@ jobs:
               END { print (w!="" ? w : fb) }')
           echo "install.wim=$WIM indice=$INDICE"
 
-          cat > aio.xml <<'XML'
+          # BISECADO: Setup responde "The answer file is invalid for pass
+          # [windowsPE]" y no dice QUE elemento. Se generan 5 variantes para
+          # localizar el culpable en una sola oleada de ejecuciones:
+          #   A = minimo: solo DiskConfiguration + UserData(AcceptEula) + ImageInstall
+          #   B = A + componente International-Core-WinPE
+          #   C = A + Compact
+          #   D = A + ProductKey
+          #   E = todo (el unattend de la sonda)
+          VARIANTE="${{ github.event.inputs.variante }}"
+          VARIANTE="${VARIANTE:-E}"
+          echo "variante a probar: $VARIANTE"
+          case "$VARIANTE" in
+            A) LANG=0; COMPACT=0; KEY=0 ;;
+            B) LANG=1; COMPACT=0; KEY=0 ;;
+            C) LANG=0; COMPACT=1; KEY=0 ;;
+            D) LANG=0; COMPACT=0; KEY=1 ;;
+            E) LANG=1; COMPACT=1; KEY=1 ;;
+            *) echo "::error::variante desconocida: $VARIANTE"; exit 1 ;;
+          esac
+
+          {
+          cat <<'HEAD'
           <?xml version="1.0" encoding="utf-8"?>
           <unattend xmlns="urn:schemas-microsoft-com:unattend"
                     xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
             <settings pass="windowsPE">
+          HEAD
+
+          if [ "$LANG" = "1" ]; then
+          cat <<'LANG'
               <component name="Microsoft-Windows-International-Core-WinPE"
                          processorArchitecture="amd64"
                          publicKeyToken="31bf3856ad364e35"
@@ -77,6 +114,10 @@ jobs:
                 <UILanguage>en-US</UILanguage>
                 <UserLocale>en-US</UserLocale>
               </component>
+          LANG
+          fi
+
+          cat <<'SETUP'
               <component name="Microsoft-Windows-Setup"
                          processorArchitecture="amd64"
                          publicKeyToken="31bf3856ad364e35"
@@ -87,9 +128,7 @@ jobs:
                     <WillWipeDisk>true</WillWipeDisk>
                     <!-- El ORDEN de los elementos lo impone el esquema XSD y Setup lo
                          respeta: CreatePartition es Order, Size, Type, Extend y
-                         ModifyPartition es Order, PartitionID, Active, Format, Label.
-                         Con otro orden el XML es well-formed pero Setup responde
-                         "The answer file is invalid for pass [windowsPE]". -->
+                         ModifyPartition es Order, PartitionID, Active, Format, Label. -->
                     <CreatePartitions>
                       <CreatePartition wcm:action="add">
                         <Order>1</Order><Size>2048</Size><Type>Primary</Type>
@@ -111,10 +150,7 @@ jobs:
                   </Disk>
                 </DiskConfiguration>
                 <!-- ImageInstall y UserData son HERMANOS de DiskConfiguration, no
-                     hijos. Anidados dentro, el XML sigue siendo well-formed (xmllint
-                     pasa) pero es invalido contra el esquema y Setup aborta con
-                     "a component or setting specified in autounattend.xml for pass
-                     [windowsPE] is missing or invalid". -->
+                     hijos: anidados son invalidos aunque el XML sea well-formed. -->
                 <ImageInstall>
                   <OSImage>
                     <InstallFrom>
@@ -124,21 +160,40 @@ jobs:
                       </MetaData>
                     </InstallFrom>
                     <InstallTo><DiskID>0</DiskID><PartitionID>2</PartitionID></InstallTo>
+          SETUP
+
+          if [ "$COMPACT" = "1" ]; then
+          cat <<'CMP'
                     <WillShowUI>OnError</WillShowUI>
                     <Compact>true</Compact>
+          CMP
+          fi
+
+          cat <<'MID'
                   </OSImage>
                 </ImageInstall>
                 <UserData>
                   <AcceptEula>true</AcceptEula>
+          MID
+
+          if [ "$KEY" = "1" ]; then
+          cat <<'KEY'
                   <ProductKey><Key>A00001-00000-00000-00000-00000</Key></ProductKey>
+          KEY
+          fi
+
+          cat <<'TAIL'
                 </UserData>
               </component>
             </settings>
           </unattend>
-          XML
+          TAIL
+          } > aio.xml
+
           sed -i "s|IDX|$INDICE|" aio.xml
           xmllint --noout aio.xml && echo "aio.xml well-formed"
-          grep -c 'wcm:action' aio.xml | sed 's/^/atributos wcm:action: /'
+          echo "=== unattend de la variante $VARIANTE ==="
+          cat aio.xml
 
           dd if=/dev/zero of=autounattend.img bs=1M count=16 status=none
           mkfs.vfat -F 16 -n UNATTEND autounattend.img > /dev/null
@@ -274,15 +329,19 @@ jobs:
           # es la unica forma de saber si Setup esta en la pantalla de idioma
           # (unattend no encontrado), en un dialogo de error, o instalando.
           sudo apt-get install -y --no-install-recommends \
-            tesseract-ocr tesseract-ocr-eng > /dev/null 2>&1 || true
+            tesseract-ocr tesseract-ocr-eng imagemagick > /dev/null 2>&1 || true
           if command -v tesseract > /dev/null 2>&1; then
             echo "tesseract disponible: $(tesseract --version 2>&1 | head -1)"
             for f in medicion/pantallas/t*.png; do
               [ -e "$f" ] || continue
               b="${f%.png}"
-              tesseract "$f" "$b"      -l eng --psm 6  2>/dev/null || true
-              tesseract "$f" "${b}.s" -l eng --psm 11 2>/dev/null || true
+              # Escalar x2 y normalizar el contraste: sobre la captura cruda el
+              # OCR sale fragmentado y no se distingue el mensaje de Setup.
+              convert "$f" -colorspace Gray -normalize -resize 200% "$b.big.png" 2>/dev/null || cp "$f" "$b.big.png"
+              tesseract "$b.big.png" "$b"      -l eng --psm 6  2>/dev/null || true
+              tesseract "$b.big.png" "${b}.s" -l eng --psm 11 2>/dev/null || true
             done
+            rm -f medicion/pantallas/*.big.png
             for t in medicion/pantallas/t*.txt; do
               [ -e "$t" ] || continue
               echo "===== $(basename "$t") ====="
