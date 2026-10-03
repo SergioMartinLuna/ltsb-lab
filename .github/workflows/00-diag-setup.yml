@@ -1,0 +1,226 @@
+name: 00-diag-setup
+
+# Diagnostico RAPIDO: arranca la VM del instalador durante unos minutos, captura
+# la pantalla por el monitor HMP de QEMU y sube las imagenes. Sirve para ver de
+# inmediato en que pantalla se queda Windows Setup, sin esperar al ciclo completo.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: preparar
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils socat netpbm python3 > /dev/null
+          mkdir -p iso/partes lab medicion/pantallas
+
+      - name: descargar-iso
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/SergioMartinLuna/ltsb-lab/releases/download/iso-14393/iso-14393.part"
+          for i in $(seq 0 31); do
+            f=$(printf 'iso/partes/p%02d' "$i")
+            code=$(curl -sSL -w '%{http_code}' -o "$f" "$BASE$(printf '%02d' "$i")")
+            if [ "$code" != "200" ]; then rm -f "$f"; break; fi
+            echo "descargado $f ($(stat -c%s "$f") bytes)"
+          done
+          cat iso/partes/p* > iso/instalador.iso
+          rm -rf iso/partes
+          echo "ISO ensamblada: $(stat -c%s iso/instalador.iso) bytes"
+          echo "3874bc7160ed10f28744dc2b00f9518af99e706296b969fb7eaf26009e1caf76  instalador.iso" > iso/esperado.sha256
+          ( cd iso && sha256sum -c esperado.sha256 )
+
+      - name: montar-y-autodetectar
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq wimtools dosfstools mtools > /dev/null
+          sudo mkdir -p iso/montada
+          sudo mount -o loop,ro iso/instalador.iso iso/montada
+          WIM=$(sudo find iso/montada -maxdepth 3 -name install.wim | head -1)
+          INDICE=$(sudo wiminfo "$WIM" | awk '
+              /^Available Images/ {f=1; next}
+              f && /^ *Index: *[0-9]+/ {idx=$2; next}
+              f && /^ *Name:/ { if (match($0,/(Enterprise|LTSB)/) && w=="") w=idx; if (fb=="") fb=idx }
+              END { print (w!="" ? w : fb) }')
+          echo "install.wim=$WIM indice=$INDICE"
+
+          cat > aio.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <unattend xmlns="urn:schemas-microsoft-com:unattend"
+                    xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+            <settings pass="windowsPE">
+              <component name="Microsoft-Windows-International-Core-WinPE"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral" versionScope="nonSxS">
+                <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+                <InputLocale>0409:00000409</InputLocale>
+                <SystemLocale>en-US</SystemLocale>
+                <UILanguage>en-US</UILanguage>
+                <UserLocale>en-US</UserLocale>
+              </component>
+              <component name="Microsoft-Windows-Setup"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral" versionScope="nonSxS">
+                <DiskConfiguration>
+                  <Disk wcm:action="add" wcm:namespace="\\?\root\wcs#diskvol0">
+                    <DiskID>0</DiskID>
+                    <WillWipeDisk>true</WillWipeDisk>
+                    <CreatePartitions>
+                      <CreatePartition wcm:action="add">
+                        <Order>1</Order><Type>Primary</Type><Size>2048</Size>
+                      </CreatePartition>
+                      <CreatePartition wcm:action="add">
+                        <Order>2</Order><Type>Primary</Type><Extend>true</Extend>
+                      </CreatePartition>
+                    </CreatePartitions>
+                    <ModifyPartitions>
+                      <ModifyPartition wcm:action="add">
+                        <Order>1</Order><PartitionID>1</PartitionID>
+                        <Format>NTFS</Format><Label>System</Label>
+                      </ModifyPartition>
+                      <ModifyPartition wcm:action="add">
+                        <Order>2</Order><PartitionID>2</PartitionID>
+                        <Format>NTFS</Format><Label>Windows</Label><Active>true</Active>
+                      </ModifyPartition>
+                    </ModifyPartitions>
+                  </Disk>
+                  <ImageInstall>
+                    <OSImage>
+                      <InstallFrom>
+                        <MetaData wcm:action="add">
+                          <Key>/IMAGE/INDEX</Key>
+                          <Value>IDX</Value>
+                        </MetaData>
+                      </InstallFrom>
+                      <InstallTo><DiskID>0</DiskID><PartitionID>2</PartitionID></InstallTo>
+                      <Compact>true</Compact>
+                      <WillShowUI>OnError</WillShowUI>
+                    </OSImage>
+                  </ImageInstall>
+                  <UserData>
+                    <AcceptEula>true</AcceptEula>
+                    <ProductKey><Key>A00001-00000-00000-00000-00000</Key></ProductKey>
+                  </UserData>
+                </DiskConfiguration>
+              </component>
+            </settings>
+          </unattend>
+          XML
+          sed -i "s|IDX|$INDICE|" aio.xml
+          xmllint --noout aio.xml && echo "aio.xml well-formed"
+          grep -c 'wcm:action' aio.xml | sed 's/^/atributos wcm:action: /'
+
+          dd if=/dev/zero of=autounattend.img bs=1M count=16 status=none
+          mkfs.vfat -F 16 -n UNATTEND autounattend.img > /dev/null
+          mcopy -i autounattend.img aio.xml ::autounattend.xml
+          echo "--- imagen FAT ---"
+          mdir -i autounattend.img ::
+
+          qemu-img create -f qcow2 lab/destino.qcow2 20G > /dev/null
+          sudo umount iso/montada
+
+      - name: cliente-hmp
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cliente HMP en Python: socat escribiendo y cerrando no es fiable,
+          # por eso el bucle de socat de la sonda no produjo ninguna captura.
+          cat > hmp.py <<'PY'
+          import socket, sys, time
+
+          def hmp(sock_path, comando):
+              s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+              s.settimeout(15)
+              try:
+                  s.connect(sock_path)
+                  time.sleep(0.3)
+                  try:
+                      s.recv(65536)
+                  except Exception:
+                      pass
+                  s.sendall((comando + "\n").encode())
+                  time.sleep(1.5)
+                  try:
+                      return s.recv(65536).decode(errors="replace")
+                  except Exception:
+                      return ""
+              finally:
+                  s.close()
+
+          ruta = sys.argv[1]
+          salida = sys.argv[2]
+          limite = int(sys.argv[3])
+          for i in range(1, limite + 1):
+              time.sleep(30)
+              destino = "%s/t%02d.ppm" % (salida, i)
+              r = hmp(ruta, 'screendump "%s"' % destino)
+              print("captura %02d -> %s" % (i, destino), flush=True)
+              print("   respuesta: %r" % (r.strip()[:120],), flush=True)
+          PY
+          echo "hmp.py escrito"
+
+      - name: arrancar-y-capturar
+        shell: bash
+        run: |
+          set -uo pipefail
+          SOCK="$PWD/monitor.sock"
+          rm -f "$SOCK"
+          qemu-img create -f qcow2 lab/destino.qcow2 20G > /dev/null 2>&1 || true
+
+          # Sin -boot d ni -no-reboot: aqui solo se quiere ver la CONSOLA del
+          # instalador, no automatizar nada.
+          qemu-system-x86_64 \
+            -accel kvm -m 4096 -smp 2 -machine q35 -vga std \
+            -drive file=lab/destino.qcow2,if=virtio,format=qcow2 \
+            -drive file=iso/instalador.iso,if=ide,media=cdrom,readonly=on \
+            -drive file=autounattend.img,if=ide,media=cdrom,readonly=on \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+            -display none -serial file:consola.log \
+            -monitor "unix:$SOCK,server,nowait" \
+            -boot order=d \
+            -no-reboot > qemu-stdout.log 2>&1 &
+          QPID=$!
+          echo "qemu pid=$QPID"
+          sleep 5
+          ls -la monitor.sock 2>&1 || echo "SIN SOCKET"
+          echo "--- primeras lineas de qemu-stdout.log ---"
+          head -20 qemu-stdout.log
+
+          python3 hmp.py "$SOCK" medicion/pantallas 8
+          echo "--- capturas obtenidas ---"
+          ls -la medicion/pantallas
+
+          kill "$QPID" 2>/dev/null || true
+          sleep 2
+          du -b lab/destino.qcow2 || true
+
+      - name: convertir-y-subir
+        if: always()
+        shell: bash
+        run: |
+          for f in medicion/pantallas/*.ppm; do
+            [ -e "$f" ] || continue
+            pnmtopng "$f" > "${f%.ppm}.png" 2>/dev/null && rm -f "$f"
+          done
+          ls -la medicion/pantallas || true
+          cp qemu-stdout.log consola.log medicion/ 2>/dev/null || true
+
+      - name: subir
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-setup
+          path: medicion/
