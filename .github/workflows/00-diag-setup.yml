@@ -20,8 +20,15 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils socat netpbm python3 > /dev/null
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils socat netpbm python3 cpu-checker > /dev/null
           mkdir -p iso/partes lab medicion/pantallas
+          # /dev/kvm es root:kvm 0660 y runner no esta en el grupo kvm: sin sudo,
+          # QEMU muere con "Could not access KVM kernel module: Permission denied".
+          if sudo kvm-ok 2>&1 | grep -q 'KVM acceleration can be used'; then
+            echo "KVM disponible"
+          else
+            echo "::error::KVM no disponible"; exit 1
+          fi
 
       - name: descargar-iso
         shell: bash
@@ -194,7 +201,12 @@ jobs:
             -no-reboot > qemu-stdout.log 2>&1 &
           QPID=$!
           echo "qemu pid=$QPID"
-          sleep 5
+          sleep 8
+          if ! kill -0 "$QPID" 2>/dev/null; then
+            echo "::error::QEMU ya habia terminado:"
+            cat qemu-stdout.log
+            exit 1
+          fi
           ls -la monitor.sock 2>&1 || echo "SIN SOCKET"
           echo "--- primeras lineas de qemu-stdout.log ---"
           head -20 qemu-stdout.log
