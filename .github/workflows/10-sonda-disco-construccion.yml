@@ -236,13 +236,25 @@ jobs:
           } >> medicion/01-iso.md
 
           # Descubre el indice de la imagen Enterprise/LTSB en vez de suponerlo.
-          # Criterio: el nombre o el nombre para mostrar contiene Enterprise.
+          # OJO: en "Index:                  1" los campos awk son $1="Index:" y $2="1".
+          # Usar $3 (error previo) deja idx vacio y la deteccion nunca dispara.
           INDICE=$(sudo wiminfo "$WIM" \
-            | awk '/^Available Images/ {f=1; next} f && /^ *Index: *[0-9]+/ {idx=$3} f && /(Enterprise|LTSB)/ && idx!="" {print idx; exit}')
+            | awk '
+                /^Available Images/ {f=1; next}
+                f && /^ *Index: *[0-9]+/ {idx=$2; next}
+                f && /^ *Name:/ {
+                  if (match($0, /(Enterprise|LTSB)/) && winner=="") winner=idx
+                  if (fallback=="") fallback=idx
+                }
+                END { print (winner!="" ? winner : fallback) }')
           if [ -z "$INDICE" ]; then
-            echo "::error::no se encontro una imagen Enterprise en install.wim"
+            echo "::error::no se encontro ninguna imagen en el WIM de instalacion"
             exit 1
           fi
+          # Evidencia: registra nombre y edicion de TODAS las imagenes candidatas.
+          sudo wiminfo "$WIM" \
+            | awk '/^Available Images/ {f=1; next} f && /^ *Index:/ {i=$2} f && /^ *(Name|Edition ID|Installation Type):/ {print "  " $0}' \
+            | tee -a medicion/01-iso.md || true
           echo "INDICE_WIM=$INDICE" >> "$GITHUB_ENV"
           echo "imagen Enterprise detectada en el indice $INDICE" | tee -a medicion/01-iso.md
           cat medicion/01-iso.md >> "$GITHUB_STEP_SUMMARY"
@@ -304,6 +316,13 @@ jobs:
                         <Order>1</Order>
                         <Type>Primary</Type>
                         <Size>2048</Size>
+                      </CreatePartition>
+                      <!-- Sin esta particion, ModifyPartition/ImageInstall apuntan a
+                           PartitionID 2 que nunca se creaba: Setup fallaba. -->
+                      <CreatePartition wcm:action="add">
+                        <Order>2</Order>
+                        <Type>Primary</Type>
+                        <Extend>true</Extend>
                       </CreatePartition>
                     </CreatePartitions>
                     <ModifyPartitions>
@@ -407,6 +426,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # Census justo ANTES de Setup. Sirve para separar el coste de la
+          # acquisition (ISO + tools) del pico propio de Windows Setup, que es
+          # lo que la aceptacion del laboratorio realmente mide.
+          AVAIL_PRE_SETUP=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+          echo "AVAIL_PRE_SETUP_BYTES=$AVAIL_PRE_SETUP" >> "$GITHUB_ENV"
+          echo "avail pre-Setup: $AVAIL_PRE_SETUP bytes"
+          {
+            echo "--- censo pre-Setup ---"
+            echo "avail_pre_setup_bytes=$AVAIL_PRE_SETUP"
+            echo "dispositivo_de_raiz=$(df -B1 --output=source / | tail -1 | tr -d ' ')"
+            echo "dispositivo_del_workspace=$(df -B1 --output=source "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')"
+            echo "iso_bytes=${{ github.event.inputs.iso_size_bytes }}"
+            echo "target_gb=${{ github.event.inputs.target_gb }}"
+          } | tee -a medicion/censo-pre-setup.md
+
           cat > sampler.sh <<SH
           #!/bin/bash
           WS="$GITHUB_WORKSPACE"
@@ -497,8 +532,13 @@ jobs:
           MIN_AVAIL=$(cat minimo.txt)
 
           PICO=$(( AVAIL_INICIAL - MIN_AVAIL ))
+          # Pico atribuible solo a Windows Setup: desde el censo pre-Setup hasta
+          # el peor momento. Es la magnitud que decide si el piso de 14 GB basta.
+          PICO_SETUP=$(( ${AVAIL_PRE_SETUP:-0} - MIN_AVAIL ))
+          [ "$PICO_SETUP" -lt 0 ] && PICO_SETUP=0
           PICO_DESTINO=$(cat pico_destino.txt)
           RESIDUO=$(( PICO - ISO_BYTES - PICO_DESTINO ))
+          [ "$RESIDUO" -lt 0 ] && RESIDUO=0
           FINAL=$(du -B1 lab/objetivo.qcow2 2>/dev/null | cut -f1 || echo 0)
 
           if [ "$MIN_AVAIL" -ge 2147483648 ] && [ "$QEMU_RC" -eq 0 ]; then
@@ -515,18 +555,28 @@ jobs:
           {
             echo "## Resultado de la medicion"
             echo
-            echo "| Magnitud solicitada | Bytes | GiB |"
+            echo "### Consumo del runner"
+            echo
+            echo "| Magnitud | Bytes | GiB |"
             echo "|---|---:|---:|"
             echo "| Espacio libre inicial real del runner | $AVAIL_INICIAL | $(awk "BEGIN{printf \"%.3f\",$AVAIL_INICIAL/1073741824}") |"
-            echo "| Espacio libre durante el despliegue | minimo observado | |"
+            echo "| Espacio libre tras limpiar toolchains | ${PRESUPUESTO_EFECTIVO_BYTES:-0} | $(awk "BEGIN{printf \"%.3f\",${PRESUPUESTO_EFECTIVO_BYTES:-0}/1073741824}") |"
+            echo "| Espacio libre justo antes de Setup | ${AVAIL_PRE_SETUP:-0} | $(awk "BEGIN{printf \"%.3f\",${AVAIL_PRE_SETUP:-0}/1073741824}") |"
+            echo
+            echo "### Pico durante Windows Setup + Compact OS"
+            echo
+            echo "| Magnitud | Bytes | GiB |"
+            echo "|---|---:|---:|"
             echo "| Espacio libre en el peor momento | $MIN_AVAIL | $(awk "BEGIN{printf \"%.3f\",$MIN_AVAIL/1073741824}") |"
+            echo "| **Pico de consumo de Setup** | $PICO_SETUP | $(awk "BEGIN{printf \"%.3f\",$PICO_SETUP/1073741824}") |"
             echo "| Espacio ocupado por la ISO | $ISO_BYTES | $(awk "BEGIN{printf \"%.3f\",$ISO_BYTES/1073741824}") |"
             echo "| Espacio ocupado por el disco destino (maximo) | $PICO_DESTINO | $(awk "BEGIN{printf \"%.3f\",$PICO_DESTINO/1073741824}") |"
             echo "| Temporales de Setup + auxiliares (residuo) | $RESIDUO | $(awk "BEGIN{printf \"%.3f\",$RESIDUO/1073741824}") |"
-            echo "| **Pico maximo real** | $PICO | $(awk "BEGIN{printf \"%.3f\",$PICO/1073741824}") |"
-            echo "| Tamano final de la base (qcow2 sin comprimir) | $FINAL | $(awk "BEGIN{printf \"%.3f\",$FINAL/1073741824}") |"
+            echo "| **Pico maximo real total** | $PICO | $(awk "BEGIN{printf \"%.3f\",$PICO/1073741824}") |"
+            echo "| Tamano final del disco destino | $FINAL | $(awk "BEGIN{printf \"%.3f\",$FINAL/1073741824}") |"
             echo
             echo "- muestras tomadas: $(wc -l < samples.tsv)"
+            echo "- instante del minimo (epoch): $(cat minimo_ts.txt 2>/dev/null || echo n/d)"
             echo "- qemu salio con codigo: $QEMU_RC"
             echo "- clase de runner: $SKU"
             echo "- conclusion: $CONCLUYENTE"
@@ -538,9 +588,11 @@ jobs:
           {
             echo "avail_inicial_bytes=$AVAIL_INICIAL"
             echo "presupuesto_efectivo_bytes=${PRESUPUESTO_EFECTIVO_BYTES:-0}"
+            echo "avail_pre_setup_bytes=${AVAIL_PRE_SETUP:-0}"
             echo "iso_bytes=$ISO_BYTES"
             echo "disco_destino_pico_bytes=$PICO_DESTINO"
             echo "min_avail_bytes=$MIN_AVAIL"
+            echo "pico_setup_bytes=$PICO_SETUP"
             echo "pico_bytes=$PICO"
             echo "disco_destino_final_bytes=$FINAL"
             echo "residuo_bytes=$RESIDUO"
