@@ -447,12 +447,14 @@ jobs:
 
           cat > sampler.sh <<SH
           #!/bin/bash
+          # Debe escribir en "\$WS/samples.tsv": es la ruta que lee el paso de
+          # medicion. Escribirlo en medicion/ dejaba samples.tsv inexistente.
           WS="$GITHUB_WORKSPACE"
           while true; do
             AVAIL=\$(df -B1 --output=avail / | tail -1 | tr -d ' ')
             TARGET=\$(du -B1 "\$WS/lab/objetivo.qcow2" 2>/dev/null | cut -f1)
             [ -z "\$TARGET" ] && TARGET=0
-            echo -e "\$(date +%s)\t\$AVAIL\t\$TARGET" >> "\$WS/medicion/samples.tsv"
+            echo "\$(date +%s)\t\$AVAIL\t\$TARGET" >> "\$WS/samples.tsv"
             sleep 2
           done
           SH
@@ -462,6 +464,11 @@ jobs:
           sleep 3
           echo "sampler pid $(cat sampler.pid); primera muestra:"
           cat samples.tsv
+          if [ ! -s samples.tsv ]; then
+            echo "::error::el sampler no produjo muestras:"
+            cat sampler.log
+            exit 1
+          fi
 
       - name: instalar-14393-con-compact-os
         shell: bash
