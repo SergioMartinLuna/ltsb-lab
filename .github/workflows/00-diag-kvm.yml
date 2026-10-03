@@ -1,0 +1,65 @@
+name: 00-diag-kvm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagostico:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: diAGNostico-de-aceleracion
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "### Diagnostico de aceleracion"
+            echo
+            echo "- cpu: \$(nproc) nucleos"
+            echo "- modelo: \$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+            echo "- hipervisor: \$(systemd-detect-virt 2>/dev/null || echo desconocido)"
+            echo
+            echo "#### /dev/kvm"
+            if [ -e /dev/kvm ]; then
+              echo "- existe: si"
+              echo "- permisos: \$(ls -l /dev/kvm)"
+              echo "- usuario: \$(id -un) grupos=\$(id -Gn)"
+              echo "- legible por el usuario: \$( [ -r /dev/kvm ] && echo si || echo no )"
+              echo "- escribible por el usuario: \$( [ -w /dev/kvm ] && echo si || echo no )"
+              echo "- legible por root: \$( sudo test -r /dev/kvm && echo si || echo no )"
+              echo "- escribible por root: \$( sudo test -w /dev/kvm && echo si || echo no )"
+            else
+              echo "- existe: NO"
+            fi
+            echo
+            echo "#### grupos relevantes"
+            grep -E '^(kvm|libvirt|docker)' /etc/group || echo "- sin grupo kvm"
+            echo
+            echo "#### kvm-ok (cpu-checker)"
+            sudo apt-get install -y -qq cpu-checker > /dev/null 2>&1 || true
+            sudo kvm-ok 2>&1 | tail -20 || true
+            echo
+            echo "#### intento real de QEMU con KVM como usuario"
+            timeout 25 qemu-system-x86_64 -accel kvm -m 128 -display none \
+              -nodefaults -S -no-reboot -qmp none </dev/null 2>&1 | head -5 || true
+            echo "rc_usuario=\${PIPESTATUS[0]}"
+            echo
+            echo "#### intento real de QEMU con KVM como root"
+            sudo timeout 25 qemu-system-x86_64 -accel kvm -m 128 -display none \
+              -nodefaults -S -no-reboot -qmp none </dev/null 2>&1 | head -5 || true
+            echo "rc_root=\${PIPESTATUS[0]}"
+            echo
+            echo "#### QEMU instalado y version"
+            qemu-system-x86_64 --version 2>&1 | head -2 || echo "qemu no instalado"
+          } | tee diagnostico-kvm.md
+          cat diagnostico-kvm.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: subir-diagnostico
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostico-kvm
+          path: diagnostico-kvm.md
