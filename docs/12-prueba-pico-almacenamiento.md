@@ -109,9 +109,15 @@ Nada de esta tabla se acepta como respuesta. Sirve para dimensionar el disco de 
    LTSB 2016 es Enterprise, así que aplica. Queda `[POR MEDIR]` si el `install.wim` concreto
    lo honra y con qué ganancia real.
 
-4. El comportamiento de particionado se declara en `DiskConfiguration`, y
-   `ImageInstall/OSImage` debe ser **hijo directo** de `DiskConfiguration` para que
-   Setup aplique la imagen. `InstallTo` apunta a la partición de datos.
+4. El comportamiento de particionado se declara en `DiskConfiguration`, dentro de
+   `Microsoft-Windows-Setup`. `ImageInstall/OSImage` y `UserData` son **hermanos** de
+   `DiskConfiguration`, **no** hijos suyos: los únicos hijos válidos de `DiskConfiguration`
+   son `Disk` y `WillShowUI`. Anidarlos dentro produce un XML *well-formed* (o sea, `xmllint`
+   pasa) pero inválido contra el esquema, y Setup aborta con
+   *"a component or setting specified in autounattend.xml for pass [windowsPE] is missing or
+   invalid"*. Confirmado empíricamente en la corrida de diagnóstico `37108788618` (el texto
+   de la pantalla se obtuvo con OCR sobre capturas HMP); por eso `scripts/validar.sh` comprueba
+   ahora la estructura, no solo la well-formedness. `InstallTo` apunta a la partición de datos.
 
 5. `autounattend.xml` no puede adjuntarse como fichero suelto a `-drive`: QEMU espera un
    dispositivo de bloque. Se empaqueta en una imagen FAT16 mínima que se expone como

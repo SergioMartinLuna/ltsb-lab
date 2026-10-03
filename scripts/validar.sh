@@ -239,6 +239,111 @@ else
 fi
 
 echo
+echo "--- unattend: estructura del esquema Microsoft-Windows-Setup ---"
+# xmllint solo dice si el XML esta bien FORMADO. Un unattend bien formado puede
+# ser invalido contra el esquema, y Setup responde:
+#   "a component or setting specified in autounattend.xml for pass [windowsPE]
+#    is missing or invalid"
+# El caso real: ImageInstall y UserData anidados DENTRO de DiskConfiguration.
+# En el esquema son HERMANOS de DiskConfiguration, y los unicos hijos validos de
+# DiskConfiguration son Disk y WillShowUI. Por eso se comprueba la estructura.
+python3 - "$WF" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+
+NS = "{urn:schemas-microsoft-com:unattend}"
+WF = sys.argv[1]
+txt = open(WF, encoding="utf-8").read()
+m = re.search(r"cat > \S+\.xml <<'XML'\n(.*?)\n\s*XML\n", txt, re.S)
+if not m:
+    print("  AVISO: no se encontro el heredoc XML en", WF)
+    sys.exit(0)
+
+# Reproducir la des-indentacion que hace bash con <<'XML' (quita 10 espacios).
+doc = "\n".join(l[10:] if l.startswith(" " * 10) else l
+                for l in m.group(1).split("\n"))
+try:
+    root = ET.fromstring(doc)
+except ET.ParseError as e:
+    print("  [FALLO] el unattend no es well-formed:", e)
+    sys.exit(1)
+
+bad = 0
+found_setup = False
+
+# El esquema XSD de unattend define SECUENCIAS: el orden de los elementos dentro
+# de un padre es obligatorio. Setup responde "The answer file is invalid for pass
+# [windowsPE]" cuando el orden no coincide, y el XML sigue siendo well-formed.
+SECUENCIAS = {
+    "CreatePartition": ["Order", "Size", "Type", "Extend"],
+    "ModifyPartition": ["Order", "PartitionID", "Active", "Format", "Label"],
+    "OSImage":         ["InstallFrom", "InstallTo", "WillShowUI", "Compact"],
+}
+
+
+def comprobar_secuencia(elem, ruta):
+    global bad
+    esperado = SECUENCIAS[elem.tag.replace(NS, "")]
+    hijos = [k.tag.replace(NS, "") for k in elem]
+    # indice de la ultima posicion conocida, para detectar saltos hacia atras
+    ultimo = -1
+    for h in hijos:
+        if h not in esperado:
+            print("  [FALLO] %s: <%s> no pertenece a %s" % (ruta, h, elem.tag.replace(NS, "")))
+            bad += 1
+            continue
+        pos = esperado.index(h)
+        if pos < ultimo:
+            print("  [FALLO] %s: orden invalido en %s -> %s"
+                  % (ruta, elem.tag.replace(NS, ""), " ".join(hijos)))
+            print("          el esquema exige: " + " ".join(esperado))
+            bad += 1
+            break
+        ultimo = pos
+
+
+def recorrer(elem, ruta):
+    tag = elem.tag.replace(NS, "")
+    if tag in SECUENCIAS:
+        comprobar_secuencia(elem, ruta)
+    for k in elem:
+        recorrer(k, ruta + "/" + tag)
+
+
+for st in root.findall(NS + "settings"):
+    for comp in st.findall(NS + "component"):
+        if comp.get("name") != "Microsoft-Windows-Setup":
+            continue
+        found_setup = True
+        dc = comp.find(NS + "DiskConfiguration")
+        if dc is None:
+            print("  [FALLO] Microsoft-Windows-Setup sin DiskConfiguration")
+            bad += 1
+        else:
+            hijos = [k.tag.replace(NS, "") for k in dc]
+            ilegales = [h for h in hijos if h not in ("Disk", "WillShowUI")]
+            if ilegales:
+                print("  [FALLO] hijos invalidos de DiskConfiguration:", "|".join(ilegales))
+                print("          deben ser HERMANOS de DiskConfiguration, no hijos")
+                bad += 1
+        for req in ("ImageInstall", "UserData"):
+            if comp.find(NS + req) is None:
+                print("  [FALLO] falta <%s> como hermano de DiskConfiguration" % req)
+                bad += 1
+        recorrer(comp, st.get("pass", "?"))
+
+if not found_setup:
+    print("  AVISO: no se encontro el componente Microsoft-Windows-Setup")
+if bad == 0:
+    print("  OK  estructura y orden de Microsoft-Windows-Setup validos")
+sys.exit(1 if bad else 0)
+PY
+if [ $? -eq 0 ]; then
+  bien "estructura del unattend valida contra el esquema"
+else
+  fallar "el unattend es invalido contra el esquema; Setup abortaria en windowsPE"
+fi
+
+echo
 if [ "$FALLA" -eq 0 ]; then
   echo "=== resultado: sin fallos ==="
 else

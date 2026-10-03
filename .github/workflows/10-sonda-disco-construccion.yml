@@ -345,11 +345,16 @@ jobs:
                   <Disk wcm:action="add" wcm:namespace="\\?\root\wcs#diskvol0">
                     <DiskID>0</DiskID>
                     <WillWipeDisk>true</WillWipeDisk>
+                    <!-- El ORDEN de los elementos lo impone el esquema XSD y Setup lo
+                         respeta: CreatePartition es Order, Size, Type, Extend y
+                         ModifyPartition es Order, PartitionID, Active, Format, Label.
+                         Con otro orden el XML es well-formed pero Setup responde
+                         "The answer file is invalid for pass [windowsPE]". -->
                     <CreatePartitions>
                       <CreatePartition wcm:action="add">
                         <Order>1</Order>
-                        <Type>Primary</Type>
                         <Size>2048</Size>
+                        <Type>Primary</Type>
                       </CreatePartition>
                       <!-- Sin esta particion, ModifyPartition/ImageInstall apuntan a
                            PartitionID 2 que nunca se creaba: Setup fallaba. -->
@@ -369,35 +374,41 @@ jobs:
                       <ModifyPartition wcm:action="add">
                         <Order>2</Order>
                         <PartitionID>2</PartitionID>
+                        <Active>true</Active>
                         <Format>NTFS</Format>
                         <Label>Windows</Label>
-                        <Active>true</Active>
                       </ModifyPartition>
                     </ModifyPartitions>
                   </Disk>
-                  <ImageInstall>
-                    <OSImage>
-                      <InstallFrom>
-                        <MetaData wcm:action="add">
-                          <Key>/IMAGE/INDEX</Key>
-                          <Value>IMAGE_INDEX</Value>
-                        </MetaData>
-                      </InstallFrom>
-                      <InstallTo>
-                        <DiskID>0</DiskID>
-                        <PartitionID>2</PartitionID>
-                      </InstallTo>
-                      <Compact>true</Compact>
-                      <WillShowUI>OnError</WillShowUI>
-                    </OSImage>
-                  </ImageInstall>
-                  <UserData>
-                    <AcceptEula>true</AcceptEula>
-                    <ProductKey>
-                      <Key>A00001-00000-00000-00000-00000</Key>
-                    </ProductKey>
-                  </UserData>
                 </DiskConfiguration>
+                <!-- ImageInstall y UserData son HERMANOS de DiskConfiguration, no
+                     hijos. Anidados dentro, el XML sigue siendo well-formed (xmllint
+                     pasa) pero es invalido contra el esquema de Microsoft-Windows-Setup
+                     y Setup aborta con "a component or setting specified in
+                     autounattend.xml for pass [windowsPE] is missing or invalid".
+                     Confirmado por OCR en la corrida de diagnostico 37108788618. -->
+                <ImageInstall>
+                  <OSImage>
+                    <InstallFrom>
+                      <MetaData wcm:action="add">
+                        <Key>/IMAGE/INDEX</Key>
+                        <Value>IMAGE_INDEX</Value>
+                      </MetaData>
+                    </InstallFrom>
+                    <InstallTo>
+                      <DiskID>0</DiskID>
+                      <PartitionID>2</PartitionID>
+                    </InstallTo>
+                    <WillShowUI>OnError</WillShowUI>
+                    <Compact>true</Compact>
+                  </OSImage>
+                </ImageInstall>
+                <UserData>
+                  <AcceptEula>true</AcceptEula>
+                  <ProductKey>
+                    <Key>A00001-00000-00000-00000-00000</Key>
+                  </ProductKey>
+                </UserData>
               </component>
             </settings>
             <settings pass="oobeSystem">
@@ -461,8 +472,18 @@ jobs:
           dd if=/dev/zero of=aio/autounattend.img bs=1M count=16 status=none
           mkfs.vfat -F 16 -n UNATTEND aio/autounattend.img > /dev/null
           mcopy -i aio/autounattend.img aio/autoinstall.xml ::autounattend.xml
-          echo "--- contenido de la imagen FAT ---"
+          echo "--- contenido de la imagen FAT (CD) ---"
           mdir -i aio/autounattend.img ::
+
+          # Ademas del CD, una copia en DISQUETE (fd0). Setup busca autounattend.xml
+          # por orden: disquete, CD/DVD, USB. Tenerlo en ambos cubre el caso de que
+          # no enumere el segundo CD.
+          rm -f aio/autounattend.flp
+          dd if=/dev/zero of=aio/autounattend.flp bs=512 count=2880 status=none
+          mkfs.vfat -F 12 -n UNATTEND aio/autounattend.flp > /dev/null
+          mcopy -i aio/autounattend.flp aio/autoinstall.xml ::autounattend.xml
+          echo "--- contenido de la imagen FAT (disquete 1.44 MB) ---"
+          mdir -i aio/autounattend.flp ::
 
       # ------------------------------------------------------------------
       # Etapa 5 — sampler en el HOST, corriendo antes de que arranque Setup
@@ -532,17 +553,43 @@ jobs:
 
           # Capturas periodicas por el monitor HMP: distinguir "compactando lento"
           # de "colgado en una pantalla de dialogo" sin adivinar.
+          # Cliente HMP propio en Python: con socat (escribir y cerrar al instante)
+          # no se obtiene ninguna captura, porque el handshake del monitor no
+          # llega a completarse.
+          cat > hmp.py <<'PY'
+          import socket, sys, time
+
+          def hmp(sock_path, comando):
+              s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+              s.settimeout(15)
+              try:
+                  s.connect(sock_path)
+                  time.sleep(0.3)
+                  try:
+                      s.recv(65536)
+                  except Exception:
+                      pass
+                  s.sendall((comando + "\n").encode())
+                  time.sleep(1.5)
+                  try:
+                      return s.recv(65536).decode(errors="replace")
+                  except Exception:
+                      return ""
+              finally:
+                  s.close()
+
+          ruta, salida, limite, intervalo = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+          for i in range(1, limite + 1):
+              time.sleep(intervalo)
+              destino = "%s/t%03d.ppm" % (salida, i)
+              r = hmp(ruta, 'screendump "%s"' % destino)
+              print("captura %03d -> %s  (%r)" % (i, destino, r.strip()[:100]), flush=True)
+          PY
+
           mkdir -p medicion/pantallas
-          rm -f monitor.qmp
-          (
-            for i in $(seq 1 120); do
-              sleep 90
-              [ -S monitor.sock ] || continue
-              printf 'screendump "%s/medicion/pantallas/t%03d.ppm"\n' \
-                "$GITHUB_WORKSPACE" "$i" \
-                | timeout 10 socat - "UNIX-CONNECT:monitor.sock" > /dev/null 2>&1 || true
-            done
-          ) &
+          rm -f monitor.sock
+          ( python3 hmp.py "$GITHUB_WORKSPACE/monitor.sock" \
+              "$GITHUB_WORKSPACE/medicion/pantallas" 120 45 > hmp.log 2>&1 ) &
 
           # GNU timeout toma un numero desnudo como SEGUNDOS. Sin la "m" final,
           # "150" significa 150 s y el vigilante mataba a QEMU en 2,5 min (rc 124).
@@ -555,25 +602,52 @@ jobs:
             -accel kvm \
             -m "${{ github.event.inputs.vm_ram_mb }}" \
             -smp 4 \
-            -machine q35 \
+            -machine pc \
             -vga std \
             -drive file=lab/objetivo.qcow2,if=virtio,format=qcow2 \
             -drive file=iso/instalador.iso,if=ide,media=cdrom,readonly=on \
             -drive file=aio/autounattend.img,if=ide,media=cdrom,readonly=on \
+            -drive file=aio/autounattend.flp,if=floppy,format=raw \
             -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
             -display none -serial file:consola-serial.log \
             -monitor unix:monitor.sock,server,nowait \
+            -debugcon file:debugcon.log -global isa-debugcon.iobase=0x402 \
             -rtc base=localtime \
             -boot d \
-            -no-reboot
+            -no-reboot > qemu-stdout.log 2>&1 &
+          QPID=$!
+
+          # Conectar a un socket unix exige permiso de ESCRITURA. QEMU arranca como
+          # root (por KVM) y crea el socket 0755, asi que el cliente HMP del usuario
+          # runner recibe PermissionError y no captura nada. El chmod tiene que
+          # hacerse MIENTRAS QEMU corre: si se hace despues, el socket ya no sirve
+          # y el cliente ya fallo.
+          for i in $(seq 1 60); do
+            [ -S monitor.sock ] && break
+            sleep 1
+          done
+          if [ -S monitor.sock ]; then
+            $PREFIJO chmod 0666 monitor.sock && echo "monitor.sock permiso 0666"
+          else
+            echo "::warning::no se creo monitor.sock; no habra capturas"
+          fi
+
+          wait "$QPID"
           RC=$?
           set -e
+
           if [ "$RC" = "124" ]; then
             echo "::error::el vigilante de ${VIGILANTE_MIN} min se disparo: Setup no terminó"
           fi
           echo "qemu termino con codigo $RC"
           echo "QEMU_RC=$RC" >> "$GITHUB_ENV"
+          sleep 3
+          pkill -f "hmp.py" 2>/dev/null || true
           echo "capturas de pantalla tomadas: $(ls medicion/pantallas | wc -l)"
+          echo "--- log del cliente HMP ---"
+          head -5 hmp.log 2>/dev/null || true
+          echo "--- salida de QEMU ---"
+          head -10 qemu-stdout.log 2>/dev/null || true
 
           # El artifact no debe llevar cientos de MB: conserva las 2 primeras y
           # las 12 ultimas capturas, y convierte a PNG.
@@ -590,6 +664,33 @@ jobs:
             pnmtopng "$f" > "${f%.ppm}.png" 2>/dev/null && rm -f "$f"
           done
           echo "capturas conservadas: $(ls -1 medicion/pantallas | wc -l)"
+
+          # OCR de las capturas:Setup deja su estado real escrito en pantalla
+          # ("a component or setting specified in autounattend.xml for pass
+          # [windowsPE] is missing or invalid", "Windows is loading files", etc.).
+          # Es la unica evidencia directa de EN QUE punto se quedo, y resulto
+          # decisiva para localizar la causa raiz.
+          sudo apt-get install -y -qq --no-install-recommends \
+            tesseract-ocr tesseract-ocr-eng > /dev/null 2>&1 || true
+          if command -v tesseract > /dev/null 2>&1; then
+            for f in medicion/pantallas/*.png; do
+              [ -e "$f" ] || continue
+              tesseract "$f" "${f%.png}" -l eng --psm 6 2>/dev/null || true
+            done
+            : > medicion/pantallas/OCR.md
+            for t in medicion/pantallas/*.txt; do
+              [ -e "$t" ] || continue
+              { echo "### $(basename "$t")"; echo; cat "$t"; echo; } >> medicion/pantallas/OCR.md
+            done
+            rm -f medicion/pantallas/*.txt
+            echo "--- OCR de las pantallas ---"
+            cat medicion/pantallas/OCR.md
+          else
+            echo "::warning::tesseract no disponible, sin OCR"
+          fi
+          cp debugcon.log qemu-stdout.log medicion/ 2>/dev/null || true
+          echo "--- prueba de arranque (SeaBIOS) ---"
+          grep -E 'Booting from|boot failed|CDROM|Floppy' debugcon.log 2>/dev/null | head -20 || true
 
           if [ ! -f consola-serial.log ]; then
             echo "::error::QEMU no llego a arrancar (sin consola-serial.log). rc=$RC"
@@ -637,6 +738,7 @@ jobs:
           # El calculo va ANTES de cualquier validacion: la guarda se apoyaba en
           # minimo.txt y lo comprobaba antes de que existiera, disparando siempre.
           awk -F'\t' 'NR==1{min=$2} $2<min{min=$2; lin=$1} END{print min > "minimo.txt"; print lin > "minimo_ts.txt"}' samples.tsv
+          awk -F'\t' 'NR==1{max=$2} $2>max{max=$2} END{print max+0 > "maximo.txt"}' samples.tsv
           awk -F'\t' 'BEGIN{m=0} $3>m{m=$3} END{print m+0 > "pico_destino.txt"}' samples.tsv
 
           if [ ! -s samples.tsv ]; then
@@ -675,7 +777,15 @@ jobs:
             exit 1
           fi
 
-          PICO=$(( AVAIL_INICIAL - MIN_AVAIL ))
+          MAX_AVAIL=$(cat maximo.txt)
+          # El pico NO se mide contra AVAIL_INICIAL: esa cifra es de antes de
+          # limpiar toolchains, y la limpieza devuelve espacio. Por eso el minimo
+          # posterior puede superar a AVAIL_INICIAL y el pico salia NEGATIVO
+          # (-30.446.538.752 B en la corrida 37100230898), que no es un consumo.
+          # La base correcta es el maximo de espacio libre observado por el sampler,
+          # que arranca antes de QEMU: el pico es la caida desde ahi.
+          PICO=$(( MAX_AVAIL - MIN_AVAIL ))
+          [ "$PICO" -lt 0 ] && PICO=0
           # Pico atribuible solo a Windows Setup: desde el censo pre-Setup hasta
           # el peor momento. Es la magnitud que decide si el piso de 14 GB basta.
           PICO_SETUP=$(( ${AVAIL_PRE_SETUP:-0} - MIN_AVAIL ))
@@ -685,7 +795,16 @@ jobs:
           [ "$RESIDUO" -lt 0 ] && RESIDUO=0
           FINAL=$(du -B1 lab/objetivo.qcow2 2>/dev/null | cut -f1 || echo 0)
 
-          if [ "$MIN_AVAIL" -ge 2147483648 ] && [ "$QEMU_RC" -eq 0 ]; then
+          # Si el disco destino nunca crecio, no hay medicion que reportar: Setup
+          # no instalo nada. Presentar un "pico" en ese caso seria falso.
+          ESCRIBIO=1
+          if [ "$QEMU_RC" != "999" ] && [ "$PICO_DESTINO" -lt 10485760 ]; then
+            ESCRIBIO=0
+          fi
+
+          if [ "$ESCRIBIO" -eq 0 ]; then
+            VEREDICTO="NO-INSTALADO"
+          elif [ "$MIN_AVAIL" -ge 2147483648 ] && [ "$QEMU_RC" -eq 0 ]; then
             VEREDICTO="VIABLE"
           else
             VEREDICTO="NO-VIABLE"
@@ -712,6 +831,7 @@ jobs:
             echo "| Magnitud | Bytes | GiB |"
             echo "|---|---:|---:|"
             echo "| Espacio libre en el peor momento | $MIN_AVAIL | $(awk "BEGIN{printf \"%.3f\",$MIN_AVAIL/1073741824}") |"
+            echo "| Espacio libre maximo observado por el sampler | $MAX_AVAIL | $(awk "BEGIN{printf \"%.3f\",$MAX_AVAIL/1073741824}") |"
             echo "| **Pico de consumo de Setup** | $PICO_SETUP | $(awk "BEGIN{printf \"%.3f\",$PICO_SETUP/1073741824}") |"
             echo "| Espacio ocupado por la ISO | $ISO_BYTES | $(awk "BEGIN{printf \"%.3f\",$ISO_BYTES/1073741824}") |"
             echo "| Espacio ocupado por el disco destino (maximo) | $PICO_DESTINO | $(awk "BEGIN{printf \"%.3f\",$PICO_DESTINO/1073741824}") |"
@@ -725,6 +845,15 @@ jobs:
             echo "- clase de runner: $SKU"
             echo "- conclusion: $CONCLUYENTE"
             echo
+            if [ "$ESCRIBIO" -eq 0 ]; then
+              echo "### ATENCION: NO MEDIDO"
+              echo
+              echo "El disco destino se quedo en $PICO_DESTINO bytes: Setup **no instalo nada**."
+              echo "El pico de consumo de Setup de la tabla anterior no es una medicion valida de"
+              echo "Windows Setup, es el ruido del qcow2 recien creado. El texto de la pantalla esta"
+              echo "en \`medicion/pantallas/OCR.md\`."
+            fi
+            echo
             echo "### COMPACT-OS-BUILD: $VEREDICTO"
           } | tee medicion/VEREDICTO.md
           cat medicion/VEREDICTO.md >> "$GITHUB_STEP_SUMMARY"
@@ -736,6 +865,7 @@ jobs:
             echo "iso_bytes=$ISO_BYTES"
             echo "disco_destino_pico_bytes=$PICO_DESTINO"
             echo "min_avail_bytes=$MIN_AVAIL"
+            echo "max_avail_bytes=$MAX_AVAIL"
             echo "pico_setup_bytes=$PICO_SETUP"
             echo "pico_bytes=$PICO"
             echo "disco_destino_final_bytes=$FINAL"
