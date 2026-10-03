@@ -197,7 +197,9 @@ jobs:
           printf '%s  instalador.iso\n' "${{ github.event.inputs.iso_sha256 }}" | tr -d '\r' > iso/esperado.sha256
           echo "--- linea de verificacion ---"
           cat iso/esperado.sha256
-          ( cd iso && sha256sum -c esperado.sha256 instalador.iso )
+          # Con -c, cualquier argumento extra se interpreta como OTRO fichero de
+          # checksums que parsear, y aborta con exit 1. Solo el fichero de checksums.
+          ( cd iso && sha256sum -c esperado.sha256 )
 
           sudo apt-get update -qq
           sudo apt-get install -y -qq wimtools > /dev/null
