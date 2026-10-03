@@ -512,7 +512,7 @@ jobs:
             -drive file=lab/objetivo.qcow2,if=virtio,format=qcow2 \
             -drive file=iso/instalador.iso,if=ide,media=cdrom,readonly=on \
             -drive file=aio/autounattend.img,if=ide,media=cdrom,readonly=on \
-            -netdev user,id=n0 -device virtio-net-pci,net=n0 \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
             -nographic -serial file:consola-serial.log \
             -rtc base=localtime \
             -boot d \
@@ -550,14 +550,10 @@ jobs:
           QEMU_RC="${QEMU_RC:-999}"
           SKU="${SKU:-desconocido}"
 
-          # Sin esto, un MIN_AVAIL vacio hacia que PICO arrastrara AVAIL_INICIAL
-          # entero y el veredicto showed 86 GiB de consumo que nunca ocurrieron.
-          if [ ! -s samples.tsv ] || [ -z "$(cat minimo.txt 2>/dev/null)" ]; then
-            echo "::error::no se pudo determinar el minimo de espacio libre"
-            echo "samples.tsv:"; head -5 samples.tsv || true
-            echo "minimo.txt: '$(cat minimo.txt 2>/dev/null)'"
-            exit 1
-          fi
+          # El calculo va ANTES de cualquier validacion: la guarda se apoyaba en
+          # minimo.txt y lo comprobaba antes de que existiera, disparando siempre.
+          awk -F'\t' 'NR==1{min=$2} $2<min{min=$2; lin=$1} END{print min > "minimo.txt"; print lin > "minimo_ts.txt"}' samples.tsv
+          awk -F'\t' 'BEGIN{m=0} $3>m{m=$3} END{print m+0 > "pico_destino.txt"}' samples.tsv
 
           if [ ! -s samples.tsv ]; then
             echo "::warning::no hay muestras: la sonda no llego a arrancar QEMU"
@@ -586,9 +582,14 @@ jobs:
             exit 0
           fi
 
-          awk -F'\t' 'NR==1{min=$2} $2<min{min=$2; lin=$1} END{print min > "minimo.txt"; print lin > "minimo_ts.txt"}' samples.tsv
-          awk -F'\t' 'BEGIN{m=0} $3>m{m=$3} END{print m+0 > "pico_destino.txt"}' samples.tsv
           MIN_AVAIL=$(cat minimo.txt)
+          # Guardia post-calculo: sin esto un MIN_AVAIL vacio hacia que PICO
+          # arrastrara AVAIL_INICIAL entero y el veredicto reportaba 86 GiB de
+          # consumo que nunca ocurrieron.
+          if [ -z "$MIN_AVAIL" ]; then
+            echo "::error::minimo.txt vacio; no hay minimo calculable de espacio libre"
+            exit 1
+          fi
 
           PICO=$(( AVAIL_INICIAL - MIN_AVAIL ))
           # Pico atribuible solo a Windows Setup: desde el censo pre-Setup hasta
