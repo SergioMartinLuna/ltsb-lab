@@ -10,14 +10,13 @@ on:
       variante:
         description: 'Variante del unattend, para bisecar que elemento lo invalida'
         required: false
-        default: 'E'
+        default: 'G'
         type: choice
         options:
-          - A
-          - B
-          - C
-          - D
-          - E
+          - F
+          - G
+          - H
+          - I
 
 permissions:
   contents: read
@@ -82,15 +81,30 @@ jobs:
           #   C = A + Compact
           #   D = A + ProductKey
           #   E = todo (el unattend de la sonda)
+          # BISECADO round 2. Lo que se aprendio en el round 1 (runs 37111265073..325):
+          #   A (base, sin idioma/clave/compact) -> llega a la pantalla de idioma.
+          #      O sea: DiskConfiguration + ImageInstall + UserData son VALIDOS.
+          #   C (base + Compact) -> igual. Compact NO es el problema.
+          #   B (base + International-Core-WinPE) -> "Windows could not apply the
+          #      unattend answer file's <DiskConfiguration> setting".
+          #   D (base + ProductKey) y E -> "The answer file is invalid".
+          # Sospecha para B: <InputLocale>0409:00000409</InputLocale>. Ese es el
+          # formato de teclado de la config regional de Windows, pero el esquema
+          # de International-Core-WinPE pide una ETIQUETA de idioma (en-US).
+          # Variantes:
+          #   F = base + idioma con InputLocale en formato etiqueta
+          #   G = F + WillShowUI=OnError dentro de DiskConfiguration
+          #   H = G + Compact
+          #   I = base + idioma con InputLocale en formato HEX + WillShowUI
+          #       (control: si I falla y G no, el InputLocale era el culpable)
           VARIANTE="${{ github.event.inputs.variante }}"
-          VARIANTE="${VARIANTE:-E}"
+          VARIANTE="${VARIANTE:-G}"
           echo "variante a probar: $VARIANTE"
           case "$VARIANTE" in
-            A) LANG=0; COMPACT=0; KEY=0 ;;
-            B) LANG=1; COMPACT=0; KEY=0 ;;
-            C) LANG=0; COMPACT=1; KEY=0 ;;
-            D) LANG=0; COMPACT=0; KEY=1 ;;
-            E) LANG=1; COMPACT=1; KEY=1 ;;
+            F) LANG=2; WU=0; COMPACT=0; KEY=0 ;;
+            G) LANG=2; WU=1; COMPACT=0; KEY=0 ;;
+            H) LANG=2; WU=1; COMPACT=1; KEY=0 ;;
+            I) LANG=1; WU=1; COMPACT=0; KEY=0 ;;
             *) echo "::error::variante desconocida: $VARIANTE"; exit 1 ;;
           esac
 
@@ -102,8 +116,9 @@ jobs:
             <settings pass="windowsPE">
           HEAD
 
-          if [ "$LANG" = "1" ]; then
-          cat <<'LANG'
+          if [ "$LANG" != "0" ]; then
+            if [ "$LANG" = "1" ]; then
+              cat <<'LANG'
               <component name="Microsoft-Windows-International-Core-WinPE"
                          processorArchitecture="amd64"
                          publicKeyToken="31bf3856ad364e35"
@@ -115,6 +130,20 @@ jobs:
                 <UserLocale>en-US</UserLocale>
               </component>
           LANG
+            else
+              cat <<'LANG'
+              <component name="Microsoft-Windows-International-Core-WinPE"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral" versionScope="nonSxS">
+                <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+                <InputLocale>en-US</InputLocale>
+                <SystemLocale>en-US</SystemLocale>
+                <UILanguage>en-US</UILanguage>
+                <UserLocale>en-US</UserLocale>
+              </component>
+          LANG
+            fi
           fi
 
           cat <<'SETUP'
@@ -148,6 +177,15 @@ jobs:
                       </ModifyPartition>
                     </ModifyPartitions>
                   </Disk>
+          SETUP
+
+          if [ "$WU" = "1" ]; then
+          cat <<'WUI'
+                  <WillShowUI>OnError</WillShowUI>
+          WUI
+          fi
+
+          cat <<'POST'
                 </DiskConfiguration>
                 <!-- ImageInstall y UserData son HERMANOS de DiskConfiguration, no
                      hijos: anidados son invalidos aunque el XML sea well-formed. -->
