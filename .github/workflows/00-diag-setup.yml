@@ -189,7 +189,7 @@ jobs:
 
           # Sin -boot d ni -no-reboot: aqui solo se quiere ver la CONSOLA del
           # instalador, no automatizar nada.
-          qemu-system-x86_64 \
+          sudo qemu-system-x86_64 \
             -accel kvm -m 4096 -smp 2 -machine q35 -vga std \
             -drive file=lab/destino.qcow2,if=virtio,format=qcow2 \
             -drive file=iso/instalador.iso,if=ide,media=cdrom,readonly=on \
