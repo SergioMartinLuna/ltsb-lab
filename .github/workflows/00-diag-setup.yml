@@ -177,15 +177,7 @@ jobs:
                       </ModifyPartition>
                     </ModifyPartitions>
                   </Disk>
-          SETUP
-
-          if [ "$WU" = "1" ]; then
-          cat <<'WUI'
-                  <WillShowUI>OnError</WillShowUI>
-          WUI
-          fi
-
-          cat <<'POST'
+                  <!--WUI-->
                 </DiskConfiguration>
                 <!-- ImageInstall y UserData son HERMANOS de DiskConfiguration, no
                      hijos: anidados son invalidos aunque el XML sea well-formed. -->
@@ -229,6 +221,13 @@ jobs:
           } > aio.xml
 
           sed -i "s|IDX|$INDICE|" aio.xml
+          # WillShowUI dentro de DiskConfiguration se decide con un marcador, para
+          # no meter heredocs anidados (que rompen el cierre de SETUP).
+          if [ "$WU" = "1" ]; then
+            sed -i 's|<!--WUI-->|<WillShowUI>OnError</WillShowUI>|' aio.xml
+          else
+            sed -i 's|<!--WUI-->||' aio.xml
+          fi
           xmllint --noout aio.xml && echo "aio.xml well-formed"
           echo "=== unattend de la variante $VARIANTE ==="
           cat aio.xml
