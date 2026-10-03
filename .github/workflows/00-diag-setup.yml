@@ -260,6 +260,28 @@ jobs:
           ls -la medicion/pantallas || true
           cp qemu-stdout.log consola.log debugcon.log medicion/ 2>/dev/null || true
 
+          # OCR de las capturas. Necesitamos el TEXTO de la pantalla, no la imagen:
+          # es la unica forma de saber si Setup esta en la pantalla de idioma
+          # (unattend no encontrado), en un dialogo de error, o instalando.
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr tesseract-ocr-eng > /dev/null 2>&1 || true
+          if command -v tesseract > /dev/null 2>&1; then
+            echo "tesseract disponible: $(tesseract --version 2>&1 | head -1)"
+            for f in medicion/pantallas/t*.png; do
+              [ -e "$f" ] || continue
+              b="${f%.png}"
+              tesseract "$f" "$b"      -l eng --psm 6  2>/dev/null || true
+              tesseract "$f" "${b}.s" -l eng --psm 11 2>/dev/null || true
+            done
+            for t in medicion/pantallas/t*.txt; do
+              [ -e "$t" ] || continue
+              echo "===== $(basename "$t") ====="
+              cat "$t"
+            done
+          else
+            echo "::warning::tesseract no disponible, sin OCR"
+          fi
+
       - name: subir
         if: always()
         uses: actions/upload-artifact@v4
