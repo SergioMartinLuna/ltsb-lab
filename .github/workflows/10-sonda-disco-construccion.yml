@@ -332,7 +332,7 @@ jobs:
                          publicKeyToken="31bf3856ad364e35"
                          language="neutral" versionScope="nonSxS">
                 <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
-                <InputLocale>0409:00000409</InputLocale>
+                <InputLocale>en-US</InputLocale>
                 <SystemLocale>en-US</SystemLocale>
                 <UILanguage>en-US</UILanguage>
                 <UserLocale>en-US</UserLocale>
@@ -404,10 +404,13 @@ jobs:
                   </OSImage>
                 </ImageInstall>
                 <UserData>
+                  <!-- SIN ProductKey. El placeholder A00001-... hace que Setup
+                       responda "The answer file is invalid" para el pase
+                       [windowsPE] (probado en la variante D del diagnostico
+                       37111272809). Y no hace falta: la variante virtio del
+                       round 4 (37114599458) instalo desatendida sin clave
+                       nenhuma, con este mismo DiskConfiguration. -->
                   <AcceptEula>true</AcceptEula>
-                  <ProductKey>
-                    <Key>A00001-00000-00000-00000-00000</Key>
-                  </ProductKey>
                 </UserData>
               </component>
             </settings>
