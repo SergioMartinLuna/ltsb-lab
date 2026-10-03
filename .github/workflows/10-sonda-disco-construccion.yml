@@ -413,7 +413,10 @@ jobs:
           # autounattend.xml debe aparecer en la raiz de un medio extraible.
           # Un fichero suelto no sirve: se empaqueta en una imagen FAT12/16 minima.
           sudo apt-get install -y -qq dosfstools mtools > /dev/null
-          dd if=/dev/zero of=aio/autounattend.img bs=1M count=2 status=none
+          # 16 MiB, no 2 MiB: FAT16 exige >=4085 clusters y con 512 B/sector
+          # eso exige >2 MiB. Con 2 MiB mkfs.vfat aborta con
+          # "too small or a too large filesystem".
+          dd if=/dev/zero of=aio/autounattend.img bs=1M count=16 status=none
           mkfs.vfat -F 16 -n UNATTEND aio/autounattend.img > /dev/null
           mcopy -i aio/autounattend.img aio/autoinstall.xml ::autounattend.xml
           echo "--- contenido de la imagen FAT ---"
