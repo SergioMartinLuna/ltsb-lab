@@ -27,7 +27,7 @@ on:
         description: "Prefijo comun de los assets (p.ej. iso-14393.part)"
         required: true
       iso_sha256:
-        description: "SHA256 de la ISO reassemblada, separado por espacio"
+        description: "SHA256 de la ISO reassemblada (sin espacios, en hex)"
         required: true
       iso_size_bytes:
         description: "Tamano exacto de la ISO reassemblada, en bytes"
@@ -44,6 +44,10 @@ on:
         description: "Indice de imagen en install.wim; vacio = autodeteccion por nombre Enterprise"
         required: false
         default: ""
+      watchdog_minutes:
+        description: "Vigilante de QEMU en minutos; rc=124 significa que Setup no termino"
+        required: false
+        default: "150"
 
 permissions:
   contents: read
@@ -266,7 +270,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils ovmf > /dev/null
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils ovmf socat > /dev/null
           mkdir -p lab
           df -B1 -T / | tail -1 > medicion/df-tras-qemu.txt
           df -B1 --output=avail / | tail -1 > medicion/avail-tras-qemu.txt
@@ -504,6 +508,28 @@ jobs:
           echo "--- qemu-system-x86_64 --version ---"
           $PREFIJO qemu-system-x86_64 --version | head -1
           echo "--- argumentos ---"
+
+          # Watchdog: WillShowUI=OnError hace que Setup muestre UI ante cualquier
+          # error y se quede esperando para siempre. Sin limite, un cuelgue consumia
+          # los 240 min del job sin dejar ver nada. rc=124 -> vigilante disparado.
+          VIGILANTE_MIN=${{ github.event.inputs.watchdog_minutes }}
+          echo "vigilante de QEMU: ${VIGILANTE_MIN} min"
+
+          # Capturas periodicas por el monitor HMP: distinguir "compactando lento"
+          # de "colgado en una pantalla de dialogo" sin adivinar.
+          mkdir -p medicion/pantallas
+          rm -f monitor.qmp
+          (
+            for i in $(seq 1 120); do
+              sleep 90
+              [ -S monitor.sock ] || continue
+              printf 'screendump "%s/medicion/pantallas/t%03d.ppm"\n' \
+                "$GITHUB_WORKSPACE" "$i" \
+                | timeout 10 socat - "UNIX-CONNECT:monitor.sock" > /dev/null 2>&1 || true
+            done
+          ) &
+
+          timeout --signal=TERM --kill-after=60 "${VIGILANTE_MIN}" \
           $PREFIJO qemu-system-x86_64 \
             -accel kvm \
             -m "${{ github.event.inputs.vm_ram_mb }}" \
@@ -513,13 +539,34 @@ jobs:
             -drive file=iso/instalador.iso,if=ide,media=cdrom,readonly=on \
             -drive file=aio/autounattend.img,if=ide,media=cdrom,readonly=on \
             -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-            -nographic -serial file:consola-serial.log \
+            -display none -serial file:consola-serial.log \
+            -monitor unix:monitor.sock,server,nowait \
             -rtc base=localtime \
             -boot d \
             -no-reboot
           RC=$?
+          if [ "$RC" = "124" ]; then
+            echo "::error::el vigilante de ${VIGILANTE_MIN} min se disparo: Setup no terminó"
+          fi
           echo "qemu termino con codigo $RC"
           echo "QEMU_RC=$RC" >> "$GITHUB_ENV"
+          echo "capturas de pantalla tomadas: $(ls medicion/pantallas | wc -l)"
+
+          # El artifact no debe llevar cientos de MB: conserva las 2 primeras y
+          # las 12 ultimas capturas, y convierte a PNG.
+          sudo apt-get install -y -qq netpbm > /dev/null 2>&1 || true
+          mapfile -t SHOTS < <(ls -1 medicion/pantallas/*.ppm 2>/dev/null || true)
+          if [ "${#SHOTS[@]}" -gt 14 ]; then
+            KEEP=( "${SHOTS[@]:0:2}" "${SHOTS[@]: -12}" )
+            for f in "${SHOTS[@]}"; do
+              case " ${KEEP[*]} " in *" $f "*) ;; *) rm -f "$f" ;; esac
+            done
+          fi
+          for f in medicion/pantallas/*.ppm; do
+            [ -e "$f" ] || continue
+            pnmtopng "$f" > "${f%.ppm}.png" 2>/dev/null && rm -f "$f"
+          done
+          echo "capturas conservadas: $(ls -1 medicion/pantallas | wc -l)"
 
           if [ ! -f consola-serial.log ]; then
             echo "::error::QEMU no llego a arrancar (sin consola-serial.log). rc=$RC"

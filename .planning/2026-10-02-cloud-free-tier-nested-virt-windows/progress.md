@@ -226,3 +226,45 @@ el SKU del piso para que el veredicto sea concluyente.
 | Error | Intentos | Resolución |
 |---|---|---|
 | Hook "PLAN TAMPERED" antes de esta fase | 1 | Releer task_plan.md desde disco antes de escribir |
+## Fase 9 — Ejecucion real (2026-10-03)
+
+Repo publico `SergioMartinLuna/ltsb-lab` creado y publicado. Release `iso-14393` con la ISO
+14393 troceada en 4 assets + `SHA256SUMS`.
+
+### Coridas de la sonda y fallos encontrados (todos por codigo, no por hipotesis)
+
+| Corrida | Sintoma | Causa raiz real | Correccion |
+|---|---|---|---|
+| 37082286247 | `sha256sum: no properly formatted checksum lines` | Se escribia el hash sin nombre de fichero | `printf '%s  instalador.iso\n'` |
+| 37082671177 | `no properly formatted checksum lines` (2a vez) | `sha256sum -c` toma el 2o argumento como OTRO fichero de checksums | Quitar el argumento extra |
+| 37082949452 | `no se encontro una imagen Enterprise` | awk sobre `Index: 1`: el indice es `$2`, no `$3` | `idx=$2` + fallback |
+| 37083720493 | `mkfs.vfat: too small or too large` | FAT16 exige >=4085 clusters; 2 MiB no alcanza | Imagen FAT16 de 16 MiB |
+| 37084124138 | `samples.tsv: No such file` | El sampler escribia en `medicion/samples.tsv`, la medicion leia `samples.tsv` | Unificar en `$WS/samples.tsv` |
+| 37084649040 | `qemu_rc=1`, 2 muestras | `Could not access KVM kernel module: Permission denied` | Ver abajo |
+| 37085255458 (diag) | — | **`kvm-ok` dice "KVM acceleration can be used"** | Diagnostico decisivo |
+| 37085639291 | QEMU no arranca | `virtio-net-pci.net` no existe en QEMU 8.2 | Usar `netdev=n0` |
+| 37085942255 | en curso | — | — |
+
+### Hallazgo clave sobre KVM
+
+La virtualizacion anidada SI esta disponible en los runners publicos. El fallo
+`Permission denied` NO era ausencia de KVM: `/dev/kvm` es `root:kvm 0660` y el usuario
+`runner` no pertenece al grupo `kvm` (`kvm:x:993:` sin miembros). La sonda ahora valida con
+`kvm-ok` y ejecuta QEMU con prefijo `sudo` cuando el usuario no tiene acceso directo.
+
+### Datos ya medidos del runner (no conclayentes para el piso de 14 GB)
+
+- AVAIL_INICIAL ~ 92.4e9 bytes (86.07 GiB) -> `SKU: grande`, no el piso garantizado.
+- Tras limpiar toolchains: ~127.0e9 bytes (118.27 GiB). La limpieza libera ~34.5 GB.
+- `avail_pre_setup` ~ 123.0e9 bytes (114.6 GiB).
+- `/` y `$GITHUB_WORKSPACE` son el mismo dispositivo (`/dev/root`).
+
+### Contenido real de la ISO (verificado dentro del runner)
+
+- `install.wim`: 1 imagen, LZX, 3.035.720.472 bytes comprimida.
+  - Index 1 = "Windows 10 Enterprise 2016 LTSB", Total Bytes 12.120.640.762 (11.29 GiB sin comprimir).
+- `boot.wim`: 2 imagenes (Windows PE x64 / Windows Setup x64), Build 14393.
+- SHA256 de la ISO ensamblada en el runner: **OK** (assets del Release verificados byte a byte).
+
+Nota de diseno: la imagen ocupa 11.29 GiB sin comprimir, asi que un disco destino de 12 GiB
+no deja margen para los temporales de Setup. La sonda se lanza con `target_gb=20`.
