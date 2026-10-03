@@ -10,13 +10,13 @@ on:
       variante:
         description: 'Variante del unattend, para bisecar que elemento lo invalida'
         required: false
-        default: 'G'
+        default: 'K'
         type: choice
         options:
-          - F
-          - G
-          - H
-          - I
+          - J
+          - K
+          - L
+          - M
 
 permissions:
   contents: read
@@ -81,30 +81,27 @@ jobs:
           #   C = A + Compact
           #   D = A + ProductKey
           #   E = todo (el unattend de la sonda)
-          # BISECADO round 2. Lo que se aprendio en el round 1 (runs 37111265073..325):
-          #   A (base, sin idioma/clave/compact) -> llega a la pantalla de idioma.
-          #      O sea: DiskConfiguration + ImageInstall + UserData son VALIDOS.
-          #   C (base + Compact) -> igual. Compact NO es el problema.
-          #   B (base + International-Core-WinPE) -> "Windows could not apply the
-          #      unattend answer file's <DiskConfiguration> setting".
-          #   D (base + ProductKey) y E -> "The answer file is invalid".
-          # Sospecha para B: <InputLocale>0409:00000409</InputLocale>. Ese es el
-          # formato de teclado de la config regional de Windows, pero el esquema
-          # de International-Core-WinPE pide una ETIQUETA de idioma (en-US).
-          # Variantes:
-          #   F = base + idioma con InputLocale en formato etiqueta
-          #   G = F + WillShowUI=OnError dentro de DiskConfiguration
-          #   H = G + Compact
-          #   I = base + idioma con InputLocale en formato HEX + WillShowUI
-          #       (control: si I falla y G no, el InputLocale era el culpable)
+          # BISECADO round 3. Round 2 (37112351512..215) dio el MISMO error en las 4
+          # variantes: "Windows could not apply the unattend answer file's
+          # <DiskConfiguration> setting". Con lo cual InputLocale NO era el
+          # problema (F con etiqueta e I con hex fallan igual) y el unico
+          # sospechoso que queda es el propio DiskConfiguration, que en el
+          # round 1 (variante A, sin componente de idioma) nunca llego a
+          # aplicarse porque Setup se quedaba en la pantalla de idioma.
+          # Candidatos: wcm:namespace="\\?\root\wcs#diskvol0" y el layout de dos
+          # particiones (System Reserved + extend).
+          #   J = sin wcm:namespace, layout de dos particiones
+          #   K = sin wcm:namespace, layout canonico de una sola particion
+          #   L = CON wcm:namespace, layout de una particion  (aísla el namespace)
+          #   M = sin wcm:namespace, una particion, sin WillWipeDisk
           VARIANTE="${{ github.event.inputs.variante }}"
-          VARIANTE="${VARIANTE:-G}"
+          VARIANTE="${VARIANTE:-K}"
           echo "variante a probar: $VARIANTE"
           case "$VARIANTE" in
-            F) LANG=2; WU=0; COMPACT=0; KEY=0 ;;
-            G) LANG=2; WU=1; COMPACT=0; KEY=0 ;;
-            H) LANG=2; WU=1; COMPACT=1; KEY=0 ;;
-            I) LANG=1; WU=1; COMPACT=0; KEY=0 ;;
+            J) LANG=2; WU=1; COMPACT=0; KEY=0; NS=0; LAYOUT=dos; WIPE=1 ;;
+            K) LANG=2; WU=1; COMPACT=0; KEY=0; NS=0; LAYOUT=uno; WIPE=1 ;;
+            L) LANG=2; WU=1; COMPACT=0; KEY=0; NS=1; LAYOUT=uno; WIPE=1 ;;
+            M) LANG=2; WU=1; COMPACT=0; KEY=0; NS=0; LAYOUT=uno; WIPE=0 ;;
             *) echo "::error::variante desconocida: $VARIANTE"; exit 1 ;;
           esac
 
@@ -152,12 +149,13 @@ jobs:
                          publicKeyToken="31bf3856ad364e35"
                          language="neutral" versionScope="nonSxS">
                 <DiskConfiguration>
-                  <Disk wcm:action="add" wcm:namespace="\\?\root\wcs#diskvol0">
+                  <Disk wcm:action="add"<!--NS-->>
                     <DiskID>0</DiskID>
-                    <WillWipeDisk>true</WillWipeDisk>
-                    <!-- El ORDEN de los elementos lo impone el esquema XSD y Setup lo
-                         respeta: CreatePartition es Order, Size, Type, Extend y
-                         ModifyPartition es Order, PartitionID, Active, Format, Label. -->
+                    <!--WIPE-->
+          SETUP
+
+          if [ "$LAYOUT" = "dos" ]; then
+          cat <<'CPDOS'
                     <CreatePartitions>
                       <CreatePartition wcm:action="add">
                         <Order>1</Order><Size>2048</Size><Type>Primary</Type>
@@ -176,6 +174,24 @@ jobs:
                         <Format>NTFS</Format><Label>Windows</Label>
                       </ModifyPartition>
                     </ModifyPartitions>
+          CPDOS
+          else
+          cat <<'CPUNO'
+                    <CreatePartitions>
+                      <CreatePartition wcm:action="add">
+                        <Order>1</Order><Type>Primary</Type><Extend>true</Extend>
+                      </CreatePartition>
+                    </CreatePartitions>
+                    <ModifyPartitions>
+                      <ModifyPartition wcm:action="add">
+                        <Order>1</Order><PartitionID>1</PartitionID><Active>true</Active>
+                        <Format>NTFS</Format><Label>Windows</Label>
+                      </ModifyPartition>
+                    </ModifyPartitions>
+          CPUNO
+          fi
+
+          cat <<'POST'
                   </Disk>
                   <!--WUI-->
                 </DiskConfiguration>
@@ -190,7 +206,7 @@ jobs:
                       </MetaData>
                     </InstallFrom>
                     <InstallTo><DiskID>0</DiskID><PartitionID>2</PartitionID></InstallTo>
-          SETUP
+          POST
 
           if [ "$COMPACT" = "1" ]; then
           cat <<'CMP'
@@ -221,12 +237,23 @@ jobs:
           } > aio.xml
 
           sed -i "s|IDX|$INDICE|" aio.xml
-          # WillShowUI dentro de DiskConfiguration se decide con un marcador, para
-          # no meter heredocs anidados (que rompen el cierre de SETUP).
+          # Marcadores opcionales resueltos con sed: WillShowUI en
+          # DiskConfiguration, wcm:namespace en el elemento Disk y WillWipeDisk.
+          # Se evitan asi los heredocs anidados, que rompian el cierre de SETUP.
           if [ "$WU" = "1" ]; then
             sed -i 's|<!--WUI-->|<WillShowUI>OnError</WillShowUI>|' aio.xml
           else
             sed -i 's|<!--WUI-->||' aio.xml
+          fi
+          if [ "$NS" = "1" ]; then
+            sed -i 's|<!--NS-->| wcm:namespace="\\?\\root\\wcs#diskvol0"|' aio.xml
+          else
+            sed -i 's|<!--NS-->||' aio.xml
+          fi
+          if [ "$WIPE" = "1" ]; then
+            sed -i 's|<!--WIPE-->|<WillWipeDisk>true</WillWipeDisk>|' aio.xml
+          else
+            sed -i 's|<!--WIPE-->||' aio.xml
           fi
           xmllint --noout aio.xml && echo "aio.xml well-formed"
           echo "=== unattend de la variante $VARIANTE ==="
