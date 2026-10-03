@@ -192,7 +192,11 @@ jobs:
             exit 1
           fi
 
-          echo "${{ github.event.inputs.iso_sha256 }}" | tr -d ' ' | grep -v '^$' > iso/esperado.sha256
+          # sha256sum -c exige el formato  "<hash>  <fichero>". Escribir solo el
+          # hash hace que el paso aborte con "no properly formatted checksum lines".
+          printf '%s  instalador.iso\n' "${{ github.event.inputs.iso_sha256 }}" | tr -d '\r' > iso/esperado.sha256
+          echo "--- linea de verificacion ---"
+          cat iso/esperado.sha256
           ( cd iso && sha256sum -c esperado.sha256 instalador.iso )
 
           sudo apt-get update -qq
@@ -458,6 +462,33 @@ jobs:
           ISO_BYTES="${ISO_BYTES:-0}"
           QEMU_RC="${QEMU_RC:-999}"
           SKU="${SKU:-desconocido}"
+
+          if [ ! -s samples.tsv ]; then
+            echo "::warning::no hay muestras: la sonda no llego a arrancar QEMU"
+            {
+              echo "## Resultado de la medicion"
+              echo
+              echo "**SIN MEDICION.** La sonda fallo antes de arrancar Windows Setup."
+              echo
+              echo "| Magnitud | Bytes | GiB |"
+              echo "|---|---:|---:|"
+              echo "| Espacio libre inicial real del runner | $AVAIL_INICIAL | $(awk "BEGIN{printf \"%.3f\",$AVAIL_INICIAL/1073741824}") |"
+              echo "| Presupuesto efectivo tras limpiar | ${PRESUPUESTO_EFECTIVO_BYTES:-0} | $(awk "BEGIN{printf \"%.3f\",${PRESUPUESTO_EFECTIVO_BYTES:-0}/1073741824}") |"
+              echo "| Espacio ocupado por la ISO | $ISO_BYTES | $(awk "BEGIN{printf \"%.3f\",$ISO_BYTES/1073741824}") |"
+              echo
+              echo "- clase de runner: $SKU"
+              echo "- qemu salio con codigo: $QEMU_RC (999 = nunca llego a ejecutarse)"
+              echo "- ver el paso fallido en el log del job"
+              echo
+              echo "### COMPACT-OS-BUILD: NO MEDIDO"
+            } | tee medicion/VEREDICTO.md
+            cat medicion/VEREDICTO.md >> "$GITHUB_STEP_SUMMARY"
+            echo "avail_inicial_bytes=$AVAIL_INICIAL" > medicion/resultado.csv
+            echo "veredicto=NO-MEDIDO" >> medicion/resultado.csv
+            echo "sku=$SKU" >> medicion/resultado.csv
+            echo "qemu_rc=$QEMU_RC" >> medicion/resultado.csv
+            exit 0
+          fi
 
           awk -F'\t' 'NR==1{min=$2} $2<min{min=$2; lin=$1} END{print min > "minimo.txt"; print lin > "minimo_ts.txt"}' samples.tsv
           awk -F'\t' 'BEGIN{m=0} $3>m{m=$3} END{print m+0 > "pico_destino.txt"}' samples.tsv
