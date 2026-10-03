@@ -208,6 +208,10 @@ jobs:
             exit 1
           fi
           ls -la monitor.sock 2>&1 || echo "SIN SOCKET"
+          # Conectar a un socket unix exige permiso de ESCRITURA sobre el socket.
+          # QEMU como root lo crea 0755 (others=r-x) y el usuario runner recibe
+          # PermissionError al conectarse.
+          sudo chmod 0666 monitor.sock && echo "monitor.sock permiso 0666"
           echo "--- primeras lineas de qemu-stdout.log ---"
           head -20 qemu-stdout.log
 
