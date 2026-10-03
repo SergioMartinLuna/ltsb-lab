@@ -318,6 +318,10 @@ jobs:
           set -uo pipefail
           SOCK="$PWD/monitor.sock"
           rm -f "$SOCK"
+          # Las variables de shell no cruzan de un step a otro: el bus se vuelve
+          # a leer del input del workflow.
+          BUS="${{ github.event.inputs.variante }}"
+          BUS="${BUS:-ide}"
 
           # -machine pc (i440fx) y no q35: q35 no tiene controlador IDE real y
           # "if=ide" no es de fiar ahi. i440fx lleva PIIX3 IDE, que es lo que
