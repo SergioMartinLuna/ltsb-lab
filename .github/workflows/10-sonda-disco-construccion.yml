@@ -52,7 +52,7 @@ jobs:
   medir:
     name: medir-pico-de-construccion
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       # ------------------------------------------------------------------
@@ -271,6 +271,31 @@ jobs:
           df -B1 -T / | tail -1 > medicion/df-tras-qemu.txt
           df -B1 --output=avail / | tail -1 > medicion/avail-tras-qemu.txt
 
+          # KVM: /dev/kvm suele existir y kvm-ok dice que es utilizable, pero es
+          # root:kvm 0660 y el usuario runner NO esta en el grupo kvm. Por eso
+          # "-accel kvm" fallaba con Permission denied pese a haber KVM.
+          QEMU_PREFIJO=""
+          if [ -e /dev/kvm ]; then
+            if sudo kvm-ok 2>&1 | grep -q 'KVM acceleration can be used'; then
+              if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+                echo "KVM utilizable directamente por $(id -un)"
+              else
+                QEMU_PREFIJO="sudo"
+                echo "KVM utilizable solo como root; se ejecutara QEMU con sudo"
+              fi
+            else
+              echo "::error::/dev/kvm existe pero kvm-ok no lo da por utilizable"
+              sudo kvm-ok 2>&1 || true
+              exit 1
+            fi
+          else
+            echo "::error::no existe /dev/kvm en este runner"
+            exit 1
+          fi
+          echo "QEMU_PREFIJO=$QEMU_PREFIJO" >> "$GITHUB_ENV"
+          echo "aceleracion=kvm (prefijo='${QEMU_PREFIJO:-ninguno}')" | tee -a medicion/02-destino.md
+          ls -l /dev/kvm | tee -a medicion/02-destino.md
+
           TARGET_GB=${{ github.event.inputs.target_gb }}
           qemu-img create -f qcow2 lab/objetivo.qcow2 "${TARGET_GB}G"
           {
@@ -473,9 +498,13 @@ jobs:
       - name: instalar-14393-con-compact-os
         shell: bash
         run: |
-          set -euo pipefail
-          set +e
-          qemu-system-x86_64 \
+          set -uo pipefail
+          PREFIJO="${QEMU_PREFIJO:-}"
+          echo "ejecutando QEMU con prefijo '${PREFIJO:-ninguno}'"
+          echo "--- qemu-system-x86_64 --version ---"
+          $PREFIJO qemu-system-x86_64 --version | head -1
+          echo "--- argumentos ---"
+          $PREFIJO qemu-system-x86_64 \
             -accel kvm \
             -m "${{ github.event.inputs.vm_ram_mb }}" \
             -smp 2 \
@@ -489,9 +518,17 @@ jobs:
             -boot d \
             -no-reboot
           RC=$?
-          set -e
           echo "qemu termino con codigo $RC"
           echo "QEMU_RC=$RC" >> "$GITHUB_ENV"
+
+          if [ ! -f consola-serial.log ]; then
+            echo "::error::QEMU no llego a arrancar (sin consola-serial.log). rc=$RC"
+            exit 1
+          fi
+          echo "--- primeras lineas de la consola serial ---"
+          head -40 consola-serial.log || true
+          echo "--- ultimas lineas de la consola serial ---"
+          tail -30 consola-serial.log || true
 
       # ------------------------------------------------------------------
       # Etapa 6 — peak real, tablas y veredictos
@@ -505,10 +542,22 @@ jobs:
           sleep 2
 
           AVAIL_INICIAL="${AVAIL_INICIAL_BYTES:-0}"
+          # El paso que escribe el censo lo exporta como AVAIL_PRE_SETUP_BYTES.
+          # Leer AVAIL_PRE_SETUP (nombre incorrecto) daba 0 y contaminaba el pico.
+          AVAIL_PRE_SETUP="${AVAIL_PRE_SETUP_BYTES:-0}"
           DISCO_TOTAL="${DISCO_TOTAL_BYTES:-0}"
           ISO_BYTES="${ISO_BYTES:-0}"
           QEMU_RC="${QEMU_RC:-999}"
           SKU="${SKU:-desconocido}"
+
+          # Sin esto, un MIN_AVAIL vacio hacia que PICO arrastrara AVAIL_INICIAL
+          # entero y el veredicto showed 86 GiB de consumo que nunca ocurrieron.
+          if [ ! -s samples.tsv ] || [ -z "$(cat minimo.txt 2>/dev/null)" ]; then
+            echo "::error::no se pudo determinar el minimo de espacio libre"
+            echo "samples.tsv:"; head -5 samples.tsv || true
+            echo "minimo.txt: '$(cat minimo.txt 2>/dev/null)'"
+            exit 1
+          fi
 
           if [ ! -s samples.tsv ]; then
             echo "::warning::no hay muestras: la sonda no llego a arrancar QEMU"
