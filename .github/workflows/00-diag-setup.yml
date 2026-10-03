@@ -104,24 +104,29 @@ jobs:
                       </ModifyPartition>
                     </ModifyPartitions>
                   </Disk>
-                  <ImageInstall>
-                    <OSImage>
-                      <InstallFrom>
-                        <MetaData wcm:action="add">
-                          <Key>/IMAGE/INDEX</Key>
-                          <Value>IDX</Value>
-                        </MetaData>
-                      </InstallFrom>
-                      <InstallTo><DiskID>0</DiskID><PartitionID>2</PartitionID></InstallTo>
-                      <Compact>true</Compact>
-                      <WillShowUI>OnError</WillShowUI>
-                    </OSImage>
-                  </ImageInstall>
-                  <UserData>
-                    <AcceptEula>true</AcceptEula>
-                    <ProductKey><Key>A00001-00000-00000-00000-00000</Key></ProductKey>
-                  </UserData>
                 </DiskConfiguration>
+                <!-- ImageInstall y UserData son HERMANOS de DiskConfiguration, no
+                     hijos. Anidados dentro, el XML sigue siendo well-formed (xmllint
+                     pasa) pero es invalido contra el esquema y Setup aborta con
+                     "a component or setting specified in autounattend.xml for pass
+                     [windowsPE] is missing or invalid". -->
+                <ImageInstall>
+                  <OSImage>
+                    <InstallFrom>
+                      <MetaData wcm:action="add">
+                        <Key>/IMAGE/INDEX</Key>
+                        <Value>IDX</Value>
+                      </MetaData>
+                    </InstallFrom>
+                    <InstallTo><DiskID>0</DiskID><PartitionID>2</PartitionID></InstallTo>
+                    <Compact>true</Compact>
+                    <WillShowUI>OnError</WillShowUI>
+                  </OSImage>
+                </ImageInstall>
+                <UserData>
+                  <AcceptEula>true</AcceptEula>
+                  <ProductKey><Key>A00001-00000-00000-00000-00000</Key></ProductKey>
+                </UserData>
               </component>
             </settings>
           </unattend>
