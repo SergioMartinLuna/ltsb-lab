@@ -320,7 +320,12 @@ jobs:
           mkdir -p aio
           cat > aio/autoinstall.xml <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
-          <unattend xmlns="urn:schemas-microsoft-com:unattend">
+          <!-- xmlns:wcm es OBLIGATORIO: todo el archivo usa atributos wcm:action y
+               wcm:namespace. Sin esta declaracion el XML no es well-formed, Setup no
+               lo parsea, cae en la UI interactiva y se queda esperando para siempre. -->
+          <unattend xmlns="urn:schemas-microsoft-com:unattend"
+                    xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <settings pass="windowsPE">
               <component name="Microsoft-Windows-International-Core-WinPE"
                          processorArchitecture="amd64"
@@ -437,6 +442,14 @@ jobs:
           INDICE="${INDICE:-$INDICE_WIM}"
           echo "usando indice de imagen: $INDICE"
           sed -i "s|IMAGE_INDEX|$INDICE|" aio/autoinstall.xml
+          # Well-formedness real: si el unattend no parsea, Setup arranca la UI
+          # interactiva y el job se queda colgado 2 h sin explicar por que.
+          sudo apt-get install -y -qq libxml2-utils > /dev/null
+          if ! xmllint --noout aio/autoinstall.xml; then
+            echo "::error::autoinstall.xml NO es well-formed; Setup lo ignoraria"
+            exit 1
+          fi
+          echo "autoinstall.xml: well-formed y con Compact=true"
           echo "unattend escrito; Compact=true presente: $(grep -c '<Compact>true</Compact>' aio/autoinstall.xml)"
 
           # autounattend.xml debe aparecer en la raiz de un medio extraible.
@@ -533,12 +546,17 @@ jobs:
 
           # GNU timeout toma un numero desnudo como SEGUNDOS. Sin la "m" final,
           # "150" significa 150 s y el vigilante mataba a QEMU en 2,5 min (rc 124).
+          # GitHub ejecuta los pasos con bash -e, asi que un rc=124 del vigilante
+          # abortaba el paso entero: QEMU_RC no se guardaba y las capturas nunca
+          # se procesaban. Hay que desactivar -e alrededor de esta llamada.
+          set +e
           timeout --signal=TERM --kill-after=60 "${VIGILANTE_MIN}m" \
           $PREFIJO qemu-system-x86_64 \
             -accel kvm \
             -m "${{ github.event.inputs.vm_ram_mb }}" \
-            -smp 2 \
+            -smp 4 \
             -machine q35 \
+            -vga std \
             -drive file=lab/objetivo.qcow2,if=virtio,format=qcow2 \
             -drive file=iso/instalador.iso,if=ide,media=cdrom,readonly=on \
             -drive file=aio/autounattend.img,if=ide,media=cdrom,readonly=on \
@@ -549,6 +567,7 @@ jobs:
             -boot d \
             -no-reboot
           RC=$?
+          set -e
           if [ "$RC" = "124" ]; then
             echo "::error::el vigilante de ${VIGILANTE_MIN} min se disparo: Setup no terminó"
           fi
@@ -580,6 +599,20 @@ jobs:
           head -40 consola-serial.log || true
           echo "--- ultimas lineas de la consola serial ---"
           tail -30 consola-serial.log || true
+
+          # Autopsia del disco destino: evidencia objetiva de si Setup escribio.
+          # Un qcow2 sin tabla de particiones significa que Setup no instalo nada.
+          echo "--- autopsia del disco destino ---"
+          qemu-img info lab/objetivo.qcow2 2>&1 | tee medicion/disco-despues-info.txt || true
+          if sudo qemu-nbd --connect /dev/nbd0 lab/objetivo.qcow2 2>/dev/null; then
+            sudo fdisk -l /dev/nbd0 2>&1 | tee medicion/disco-despues-fdisk.txt || true
+            sudo blkid /dev/nbd0p1 /dev/nbd0p2 2>&1 | tee medicion/disco-despues-blkid.txt || true
+            sudo qemu-nbd --disconnect /dev/nbd0 2>/dev/null || true
+          else
+            echo "no se pudo montar el qcow2 para inspeccionarlo" | tee medicion/disco-despues-fdisk.txt
+          fi
+          PARTICIONES=$(grep -c '^/dev/nbd0p' medicion/disco-despues-fdisk.txt 2>/dev/null || echo 0)
+          echo "particiones detectadas en el destino: $PARTICIONES"
 
       # ------------------------------------------------------------------
       # Etapa 6 — peak real, tablas y veredictos

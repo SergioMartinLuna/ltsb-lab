@@ -221,6 +221,24 @@ PY
 fi
 
 echo
+echo "--- unattend: namespace wcm y well-formedness ---"
+WF=".github/workflows/10-sonda-disco-construccion.yml"
+# Sin xmlns:wcm el unattend usa prefijos no declarados: no es well-formed,
+# Setup lo ignora y arranca la UI interactiva. Se comprueba de forma estatica.
+if grep -q 'wcm:action=' "$WF"; then
+  if grep -q 'xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"' "$WF"; then
+    bien "unattend declara xmlns:wcm"
+  else
+    fallar "el unattend usa wcm:action pero NO declara xmlns:wcm (Setup lo ignoraria)"
+  fi
+fi
+if grep -q 'xmllint --noout aio/autoinstall.xml' "$WF"; then
+  bien "el workflow valida la well-formedness del unattend en tiempo de ejecucion"
+else
+  fallar "el workflow no valida la well-formedness del unattend"
+fi
+
+echo
 if [ "$FALLA" -eq 0 ]; then
   echo "=== resultado: sin fallos ==="
 else
